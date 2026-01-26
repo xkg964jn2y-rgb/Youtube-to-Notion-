@@ -33,7 +33,7 @@ pip install requests pandas pytz google-api-python-client
 
 ### Clone the repository:
 
-git clone https://github.com/your-username/youtube-notion-sync.git
+git clone https://github.com/xkg964jn2y-rgb/Youtube-to-Notion-
 cd youtube-notion-sync
 
 
