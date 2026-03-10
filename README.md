@@ -1,121 +1,48 @@
-# Youtube-to-Notion
-This Python project fetches video data from YouTube using the YouTube Data API and automatically adds or updates entries in a Notion database, including channel details and video metadata.
+YouTube to Notion Sync
+A Python pipeline that fetches YouTube video and channel metadata via the YouTube Data API and syncs it into a Notion database — with deduplication, smart updates, and relational linking between videos and channels.
+📊 Scale
 
-## Features
+22,000+ YouTube videos processed
+3,000+ channels tracked
+Handles batching, error recovery, and duplicate detection automatically
 
-Fetch video metadata such as title, duration, publish date, category, thumbnail, and more from YouTube.
+✨ Features
 
-Retrieve channel information including logo and custom URL.
+Fetches video details: title, duration, thumbnail, category, publish date
+Fetches channel details: name, logo, custom URL
+Creates relational links between videos and their channels in Notion
+Deduplication — skips or updates existing entries, never creates duplicates
+Supports two input modes: CSV file or manual video ID entry
+Structured logging throughout for easy debugging
 
-Automatically add new video entries to Notion database or update existing entries.
+🛠 Tech Stack
 
-Maintain a relational link between videos and channels in Notion.
-
-Supports batch input of video IDs via CSV or manual entry.
-
-Converts YouTube video durations to human-readable format.
-
-Automatically fetches YouTube video category names.
-
-## Requirements
-
-Python 3.8+
-
-YouTube Data API Key
-
-Notion Integration Token and Database IDs
-
-Required Python packages:
-
-pip install requests pandas pytz google-api-python-client
-
-## Setup
-
-### Clone the repository:
-
-git clone https://github.com/xkg964jn2y-rgb/Youtube-to-Notion-
-cd youtube-notion-sync
+Python
+YouTube Data API v3
+Notion API
+google-api-python-client, pandas, requests, python-dotenv
 
 
-### Obtain API keys:
+Create a .env file in the root directory:
+YOUTUBE_API_KEY=your_youtube_api_key
+NOTION_API_KEY=your_notion_integration_token
+VIDEO_DATABASE_ID=your_notion_video_database_id
+CHANNEL_DATABASE_ID=your_notion_channel_database_id
 
-YouTube Data API Key
+Set up Notion Databases
+Video Database — requires these properties:
+PropertyTypeNameTitleVideo IdTextDateDateDurationTextThumbnailURLURLURLCategory IdSelectCategory NameSelectChannelRelation → Channel DB
+Channel Database — requires these properties:
+PropertyTypeNameTitleChannel IdTextURLURL
 
-Notion Integration Token
-
-### Update the script with your credentials:
-
-api_key = 'YOUR_YOUTUBE_API_KEY'
-notion_api_key = 'YOUR_NOTION_API_KEY'
-video_database_id = 'YOUR_NOTION_VIDEO_DATABASE_ID'
-channel_database_id = 'YOUR_NOTION_CHANNEL_DATABASE_ID'
-
-
-### Prepare video IDs:
-
-Option 1: Create a CSV file with a column Video Id.
-
-Option 2: Input video IDs manually when prompted.
-
-## Usage
-
-Run the script:
-
+▶️ Usage
 python main.py
+You'll be prompted to choose an input method:
 
+csv — provide a CSV file with a Video Id column
+manual — enter video IDs directly, comma-separated
 
-Choose the input option:
+🔑 Getting API Keys
 
-csv – Provide a CSV file with video IDs.
-
-manual – Enter video IDs manually separated by commas.
-
-The script fetches video and channel data from YouTube and updates or adds entries in Notion automatically.
-
-## How it Works
-
-### Fetch Video Data
-
-Uses YouTube Data API to get video details: title, duration, thumbnail, category, channel info.
-
-Converts ISO 8601 duration format to a human-readable string.
-
-### Fetch Channel Data
-
-Retrieves channel logo and custom URL.
-
-Checks if the channel already exists in Notion before adding a new entry.
-
-### Add or Update Video in Notion
-
-Checks if the video already exists in the Notion database.
-
-Updates the entry if video data has changed.
-
-Links the video to the corresponding channel entry in Notion.
-
-## Example
-
-### CSV input:
-
-Video Id
-dQw4w9WgXcQ
-3JZ_D3ELwOQ
-
-
-### Manual input:
-
-Enter video IDs separated by commas: dQw4w9WgXcQ, 3JZ_D3ELwOQ
-
-
-The script then fetches all video and channel details and updates your Notion database.
-
-## Notes
-
-Make sure your Notion database has the required properties:
-
-Video Database: Name, Video Id, Date, Duration, Thumbnail, URL, Category Id, Category Name, Channel (relation to Channel database)
-
-Channel Database: Name, Channel Id, URL, Logo (optional)
-
-Ensure the YouTube Data API quota is sufficient for your video requests.
+YouTube Data API v3 → Google Cloud Console
+Notion Integration Token → Notion Developers
