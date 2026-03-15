@@ -1,1 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YT → Notion Sync</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
 
+    body {
+      font-family: system-ui, sans-serif;
+      background: #f5f5f5;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+
+    .card {
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 2rem;
+      width: 100%;
+      max-width: 440px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    }
+
+    h1 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: #111;
+      margin-bottom: 1.5rem;
+    }
+
+    .field { margin-bottom: 1rem; }
+
+    label {
+      display: block;
+      font-size: 0.78rem;
+      font-weight: 500;
+      color: #555;
+      margin-bottom: 0.3rem;
+    }
+
+    input, textarea {
+      width: 100%;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+      padding: 0.5rem 0.7rem;
+      font-size: 0.85rem;
+      color: #111;
+      background: #fff;
+      outline: none;
+      transition: border-color 0.15s;
+      font-family: inherit;
+    }
+
+    input:focus, textarea:focus { border-color: #888; }
+    textarea { resize: vertical; }
+
+    .divider { border: none; border-top: 1px solid #eee; margin: 1.2rem 0; }
+
+    .mode-row {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 1rem;
+    }
+
+    .mode-btn {
+      flex: 1;
+      padding: 0.45rem;
+      font-size: 0.78rem;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+      background: #fff;
+      color: #888;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .mode-btn.active {
+      background: #111;
+      border-color: #111;
+      color: #fff;
+    }
+
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    /* File drop */
+    .file-drop {
+      border: 1px dashed #ccc;
+      border-radius: 5px;
+      padding: 1rem;
+      text-align: center;
+      font-size: 0.8rem;
+      color: #999;
+      cursor: pointer;
+      transition: all 0.15s;
+      margin-bottom: 0.5rem;
+    }
+
+    .file-drop:hover, .file-drop.over { border-color: #888; color: #555; background: #fafafa; }
+    .file-drop.loaded { border-color: #4caf50; color: #4caf50; background: #f6fff6; border-style: solid; }
+
+    .file-note { font-size: 0.72rem; color: #aaa; margin-bottom: 0.8rem; }
+    .file-note.ok { color: #4caf50; }
+
+    .or { text-align: center; font-size: 0.72rem; color: #bbb; margin: 0.6rem 0; }
+
+    button[type="submit"] {
+      width: 100%;
+      margin-top: 1.2rem;
+      padding: 0.65rem;
+      background: #111;
+      color: #fff;
+      border: none;
+      border-radius: 5px;
+      font-size: 0.88rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+    }
+
+    button[type="submit"]:hover:not(:disabled) { background: #333; }
+    button[type="submit"]:disabled { background: #ccc; cursor: not-allowed; }
+
+    .spinner {
+      display: none;
+      width: 13px; height: 13px;
+      border: 2px solid #fff;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+    }
+
+    .loading .spinner { display: block; }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .status {
+      margin-top: 1rem;
+      padding: 0.6rem 0.8rem;
+      border-radius: 5px;
+      font-size: 0.78rem;
+      line-height: 1.5;
+      display: none;
+    }
+
+    .status.show { display: block; }
+    .status.ok  { background: #f0faf0; color: #2e7d32; border: 1px solid #a5d6a7; }
+    .status.err { background: #fff0f0; color: #c62828; border: 1px solid #ef9a9a; }
+    .status a { color: inherit; }
+  </style>
+</head>
+<body>
+
+<div class="card">
+  <h1>YouTube → Notion Sync</h1>
+
+  <!-- GitHub config -->
+  <div class="field">
+    <label>GitHub Owner</label>
+    <input id="owner" type="text" placeholder="your-username" />
+  </div>
+  <div class="field">
+    <label>Repository</label>
+    <input id="repo" type="text" placeholder="your-repo-name" />
+  </div>
+  <div class="field">
+    <label>Personal Access Token</label>
+    <input id="token" type="password" placeholder="ghp_xxxxxxxxxxxxxxxxxxxx" />
+  </div>
+
+  <hr class="divider" />
+
+  <!-- Mode -->
+  <div class="mode-row">
+    <button class="mode-btn active" id="btnCsv"    onclick="setMode('csv')">CSV File</button>
+    <button class="mode-btn"        id="btnManual" onclick="setMode('manual')">Manual IDs</button>
+  </div>
+
+  <!-- CSV panel -->
+  <div class="panel active" id="panelCsv">
+    <div
+      class="file-drop" id="fileDrop"
+      onclick="document.getElementById('csvFile').click()"
+      ondragover="ev(event,'over')" ondragleave="ev(event,'')" ondrop="drop(event)"
+    >
+      <input type="file" id="csvFile" accept=".csv" style="display:none" onchange="pickFile(event)" />
+      <span id="fileLabel">Click or drag a .csv file here</span>
+    </div>
+    <div class="file-note" id="fileNote"></div>
+    <div class="or">or paste IDs below</div>
+    <textarea id="pasteIds" rows="3" placeholder="dQw4w9WgXcQ&#10;jNQXAC9IVRw"></textarea>
+  </div>
+
+  <!-- Manual panel -->
+  <div class="panel" id="panelManual">
+    <textarea id="manualIds" rows="3" placeholder="dQw4w9WgXcQ, jNQXAC9IVRw, 9bZkp7q19f0"></textarea>
+  </div>
+
+  <button type="submit" id="runBtn" onclick="trigger()">
+    <span class="spinner"></span>
+    <span id="btnLabel">Run Sync</span>
+  </button>
+
+  <div class="status" id="status"></div>
+</div>
+
+<script>
+  const WORKFLOW = 'sync.yml';
+  let mode = 'csv';
+  let fileIds = [];
+
+  // Persist fields
+  ['owner','repo','token','pasteIds','manualIds'].forEach(id => {
+    const el = document.getElementById(id);
+    const v = localStorage.getItem('ytn_' + id);
+    if (v) el.value = v;
+    el.addEventListener('input', () => localStorage.setItem('ytn_' + id, el.value));
+  });
+
+  const sm = localStorage.getItem('ytn_mode');
+  if (sm) setMode(sm);
+
+  function setMode(m) {
+    mode = m;
+    localStorage.setItem('ytn_mode', m);
+    document.getElementById('btnCsv').classList.toggle('active', m === 'csv');
+    document.getElementById('btnManual').classList.toggle('active', m === 'manual');
+    document.getElementById('panelCsv').classList.toggle('active', m === 'csv');
+    document.getElementById('panelManual').classList.toggle('active', m === 'manual');
+  }
+
+  function ev(e, cls) {
+    e.preventDefault();
+    document.getElementById('fileDrop').className = 'file-drop' + (cls ? ' ' + cls : '');
+  }
+
+  function drop(e) {
+    e.preventDefault();
+    document.getElementById('fileDrop').className = 'file-drop';
+    if (e.dataTransfer.files[0]) readFile(e.dataTransfer.files[0]);
+  }
+
+  function pickFile(e) { if (e.target.files[0]) readFile(e.target.files[0]); }
+
+  function readFile(file) {
+    const reader = new FileReader();
+    reader.onload = e => {
+      const lines = e.target.result.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
+      const data = /video.?id|^id$/i.test(lines[0]) ? lines.slice(1) : lines;
+      fileIds = data.map(l => l.split(',')[0].replace(/"/g, '').trim()).filter(Boolean);
+      document.getElementById('fileDrop').className = 'file-drop loaded';
+      document.getElementById('fileLabel').textContent = '✓ ' + file.name;
+      const note = document.getElementById('fileNote');
+      note.textContent = fileIds.length + ' video IDs loaded';
+      note.className = 'file-note ok';
+    };
+    reader.readAsText(file);
+  }
+
+  function setStatus(type, html) {
+    const el = document.getElementById('status');
+    el.className = 'status show ' + type;
+    el.innerHTML = html;
+  }
+
+  async function trigger() {
+    const owner = document.getElementById('owner').value.trim();
+    const repo  = document.getElementById('repo').value.trim();
+    const token = document.getElementById('token').value.trim();
+
+    if (!owner || !repo || !token) { setStatus('err', 'Please fill in GitHub owner, repo, and token.'); return; }
+
+    const inputs = { input_option: mode };
+
+    if (mode === 'csv') {
+      const ids = fileIds.length
+        ? fileIds
+        : document.getElementById('pasteIds').value.trim().split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+      if (!ids.length) { setStatus('err', 'Upload a CSV or paste at least one video ID.'); return; }
+      inputs.csv_content = ids.join(',');
+    } else {
+      const raw = document.getElementById('manualIds').value.trim();
+      if (!raw) { setStatus('err', 'Enter at least one video ID.'); return; }
+      inputs.video_ids = raw;
+    }
+
+    const btn = document.getElementById('runBtn');
+    btn.disabled = true;
+    btn.classList.add('loading');
+    document.getElementById('btnLabel').textContent = 'Running...';
+
+    try {
+      const res = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${WORKFLOW}/dispatches`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/vnd.github+json',
+            'Content-Type': 'application/json',
+            'X-GitHub-Api-Version': '2022-11-28'
+          },
+          body: JSON.stringify({ ref: 'main', inputs })
+        }
+      );
+
+      if (res.status === 204) {
+        setStatus('ok', `Sync triggered! <a href="https://github.com/${owner}/${repo}/actions" target="_blank">View on GitHub Actions →</a>`);
+      } else {
+        const b = await res.json().catch(() => ({}));
+        setStatus('err', `GitHub error ${res.status}: ${b.message || 'Unknown error'}`);
+      }
+    } catch (e) {
+      setStatus('err', 'Network error: ' + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove('loading');
+      document.getElementById('btnLabel').textContent = 'Run Sync';
+    }
+  }
+</script>
+</body>
+</html>
