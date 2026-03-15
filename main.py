@@ -724,12 +724,9 @@ def get_video_data(input_option=None, video_ids=None, file_path=None):
             return None
             
     elif input_option == "manual":
-        user_input = input("Enter video IDs separated by commas: ").strip()
-        if not user_input:
-            logger.error("No video IDs provided")
-            return None
-        
-        video_ids = [vid.strip() for vid in user_input.split(',') if vid.strip()]
+    if not video_ids:
+        logger.error("No video IDs provided")
+        return None
         
         if not video_ids:
             logger.error("No valid video IDs found in input")
