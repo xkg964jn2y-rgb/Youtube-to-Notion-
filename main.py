@@ -724,10 +724,10 @@ def get_video_data(input_option=None, video_ids=None, file_path=None):
             return None
             
     elif input_option == "manual":
-    if not video_ids:
-        logger.error("No video IDs provided")
-        return None
-        
+        if not video_ids:
+            logger.error("No video IDs provided")
+            return None
+            
         if not video_ids:
             logger.error("No valid video IDs found in input")
             return None
