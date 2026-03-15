@@ -1,1 +1,5 @@
-
+requests
+pandas
+pytz
+google-api-python-client
+python-dotenv
