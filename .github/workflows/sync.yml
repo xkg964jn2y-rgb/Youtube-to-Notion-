@@ -1,1 +1,58 @@
+name: YouTube → Notion Sync
 
+on:
+  workflow_dispatch:
+    inputs:
+      input_option:
+        description: "Input method"
+        required: true
+        default: "csv"
+        type: choice
+        options:
+          - csv
+          - manual
+      video_ids:
+        description: "Video IDs (comma-separated, only for manual mode)"
+        required: false
+        default: ""
+      csv_content:
+        description: "CSV content (paste rows as: VideoId1,VideoId2 — only for csv mode)"
+        required: false
+        default: ""
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Prepare CSV file (if csv mode)
+        if: ${{ github.event.inputs.input_option == 'csv' && github.event.inputs.csv_content != '' }}
+        run: |
+          echo "Video Id" > input_videos.csv
+          echo "${{ github.event.inputs.csv_content }}" | tr ',' '\n' >> input_videos.csv
+          echo "Generated input_videos.csv:"
+          cat input_videos.csv
+
+      - name: Run sync script
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          VIDEO_DATABASE_ID: ${{ secrets.VIDEO_DATABASE_ID }}
+          CHANNEL_DATABASE_ID: ${{ secrets.CHANNEL_DATABASE_ID }}
+          INPUT_OPTION: ${{ github.event.inputs.input_option }}
+          VIDEO_IDS: ${{ github.event.inputs.video_ids }}
+          CSV_FILE_PATH: "input_videos.csv"
+        run: |
+          python run_sync.py
