@@ -141,7 +141,6 @@
     }
 
     .loading .spinner { display: block; }
-
     @keyframes spin { to { transform: rotate(360deg); } }
 
     .status {
@@ -154,9 +153,81 @@
     }
 
     .status.show { display: block; }
-    .status.ok  { background: #f0faf0; color: #2e7d32; border: 1px solid #a5d6a7; }
-    .status.err { background: #fff0f0; color: #c62828; border: 1px solid #ef9a9a; }
+    .status.ok   { background: #f0faf0; color: #2e7d32; border: 1px solid #a5d6a7; }
+    .status.err  { background: #fff0f0; color: #c62828; border: 1px solid #ef9a9a; }
+    .status.info { background: #fffde7; color: #f57f17; border: 1px solid #ffe082; }
     .status a { color: inherit; }
+
+    /* NEW: live poll row */
+    .poll-row {
+      display: none;
+      align-items: center;
+      gap: 0.5rem;
+      margin-top: 0.6rem;
+      font-size: 0.72rem;
+      color: #888;
+    }
+
+    .poll-row.show { display: flex; }
+
+    .poll-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: #f57f17;
+      flex-shrink: 0;
+      animation: blink 1.2s ease-in-out infinite;
+    }
+
+    .poll-dot.ok  { background: #4caf50; animation: none; }
+    .poll-dot.err { background: #c62828; animation: none; }
+
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.25} }
+
+    /* NEW: run history */
+    .history-section {
+      margin-top: 1.4rem;
+      border-top: 1px solid #eee;
+      padding-top: 1rem;
+    }
+
+    .history-title {
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 0.7rem;
+    }
+
+    .run-row {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.4rem 0;
+      border-bottom: 1px solid #f2f2f2;
+      font-size: 0.75rem;
+      color: #555;
+    }
+
+    .run-row:last-child { border-bottom: none; }
+
+    .run-badge {
+      font-size: 0.68rem;
+      padding: 0.1rem 0.4rem;
+      border-radius: 3px;
+      white-space: nowrap;
+    }
+
+    .badge-success { background: #f0faf0; color: #2e7d32; border: 1px solid #a5d6a7; }
+    .badge-failure { background: #fff0f0; color: #c62828; border: 1px solid #ef9a9a; }
+    .badge-running { background: #fffde7; color: #f57f17; border: 1px solid #ffe082; }
+    .badge-queued  { background: #f5f5f5; color: #888;    border: 1px solid #ddd; }
+
+    .run-meta { flex: 1; }
+    .run-link { color: #aaa; text-decoration: none; font-size: 0.7rem; }
+    .run-link:hover { color: #555; }
+
+    .history-msg { font-size: 0.75rem; color: #aaa; }
   </style>
 </head>
 <body>
@@ -197,13 +268,13 @@
       <span id="fileLabel">Click or drag a .csv file here</span>
     </div>
     <div class="file-note" id="fileNote"></div>
-    <div class="or">or paste IDs below</div>
-    <textarea id="pasteIds" rows="3" placeholder="dQw4w9WgXcQ&#10;jNQXAC9IVRw"></textarea>
+    <div class="or">or paste IDs / YouTube URLs below</div>
+    <textarea id="pasteIds" rows="3" placeholder="dQw4w9WgXcQ&#10;https://youtube.com/watch?v=jNQXAC9IVRw&#10;https://youtu.be/9bZkp7q19f0"></textarea>
   </div>
 
   <!-- Manual panel -->
   <div class="panel" id="panelManual">
-    <textarea id="manualIds" rows="3" placeholder="dQw4w9WgXcQ, jNQXAC9IVRw, 9bZkp7q19f0"></textarea>
+    <textarea id="manualIds" rows="3" placeholder="dQw4w9WgXcQ, https://youtu.be/jNQXAC9IVRw, 9bZkp7q19f0"></textarea>
   </div>
 
   <button type="submit" id="runBtn" onclick="trigger()">
@@ -212,14 +283,28 @@
   </button>
 
   <div class="status" id="status"></div>
+
+  <!-- NEW: live poll indicator -->
+  <div class="poll-row" id="pollRow">
+    <div class="poll-dot" id="pollDot"></div>
+    <span id="pollLabel">Waiting for run to start…</span>
+    <a id="pollLink" href="#" target="_blank" class="run-link" style="margin-left:auto">GitHub →</a>
+  </div>
+
+  <!-- NEW: run history -->
+  <div class="history-section">
+    <div class="history-title">Recent Runs</div>
+    <div id="historyList"><span class="history-msg">Fill in config above to load history</span></div>
+  </div>
 </div>
 
 <script>
   const WORKFLOW = 'sync.yml';
   let mode = 'csv';
   let fileIds = [];
+  let pollTimer = null;
 
-  // Persist fields
+  // ── Persist fields ──────────────────────────────────────────────
   ['owner','repo','token','pasteIds','manualIds'].forEach(id => {
     const el = document.getElementById(id);
     const v = localStorage.getItem('ytn_' + id);
@@ -230,6 +315,27 @@
   const sm = localStorage.getItem('ytn_mode');
   if (sm) setMode(sm);
 
+  // ── YouTube URL → ID extractor (UPGRADE 3) ──────────────────────
+  function extractId(raw) {
+    raw = raw.trim();
+    if (/^[A-Za-z0-9_-]{11}$/.test(raw)) return raw;
+    try {
+      const url = new URL(raw.startsWith('http') ? raw : 'https://' + raw);
+      if (url.hostname === 'youtu.be') return url.pathname.slice(1).split('?')[0];
+      const shorts = url.pathname.match(/\/shorts\/([A-Za-z0-9_-]{11})/);
+      if (shorts) return shorts[1];
+      const v = url.searchParams.get('v');
+      if (v) return v;
+    } catch(_) {}
+    const m = raw.match(/[A-Za-z0-9_-]{11}/);
+    return m ? m[0] : raw;
+  }
+
+  function parseIds(raw) {
+    return raw.split(/[\n,]+/).map(s => extractId(s.trim())).filter(Boolean);
+  }
+
+  // ── Mode toggle ─────────────────────────────────────────────────
   function setMode(m) {
     mode = m;
     localStorage.setItem('ytn_mode', m);
@@ -239,6 +345,7 @@
     document.getElementById('panelManual').classList.toggle('active', m === 'manual');
   }
 
+  // ── File drop ───────────────────────────────────────────────────
   function ev(e, cls) {
     e.preventDefault();
     document.getElementById('fileDrop').className = 'file-drop' + (cls ? ' ' + cls : '');
@@ -257,7 +364,7 @@
     reader.onload = e => {
       const lines = e.target.result.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
       const data = /video.?id|^id$/i.test(lines[0]) ? lines.slice(1) : lines;
-      fileIds = data.map(l => l.split(',')[0].replace(/"/g, '').trim()).filter(Boolean);
+      fileIds = data.map(l => extractId(l.split(',')[0].replace(/"/g, '').trim())).filter(Boolean);
       document.getElementById('fileDrop').className = 'file-drop loaded';
       document.getElementById('fileLabel').textContent = '✓ ' + file.name;
       const note = document.getElementById('fileNote');
@@ -267,12 +374,30 @@
     reader.readAsText(file);
   }
 
+  // ── Status helpers ──────────────────────────────────────────────
   function setStatus(type, html) {
     const el = document.getElementById('status');
     el.className = 'status show ' + type;
     el.innerHTML = html;
   }
 
+  // ── GitHub helpers ──────────────────────────────────────────────
+  function ghHeaders() {
+    return {
+      'Authorization': `Bearer ${document.getElementById('token').value.trim()}`,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'X-GitHub-Api-Version': '2022-11-28'
+    };
+  }
+
+  function repoBase() {
+    const o = document.getElementById('owner').value.trim();
+    const r = document.getElementById('repo').value.trim();
+    return `https://api.github.com/repos/${o}/${r}`;
+  }
+
+  // ── Trigger ─────────────────────────────────────────────────────
   async function trigger() {
     const owner = document.getElementById('owner').value.trim();
     const repo  = document.getElementById('repo').value.trim();
@@ -285,49 +410,168 @@
     if (mode === 'csv') {
       const ids = fileIds.length
         ? fileIds
-        : document.getElementById('pasteIds').value.trim().split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
-      if (!ids.length) { setStatus('err', 'Upload a CSV or paste at least one video ID.'); return; }
+        : parseIds(document.getElementById('pasteIds').value);
+      if (!ids.length) { setStatus('err', 'Upload a CSV or paste at least one video ID or URL.'); return; }
       inputs.csv_content = ids.join(',');
     } else {
       const raw = document.getElementById('manualIds').value.trim();
-      if (!raw) { setStatus('err', 'Enter at least one video ID.'); return; }
-      inputs.video_ids = raw;
+      if (!raw) { setStatus('err', 'Enter at least one video ID or URL.'); return; }
+      inputs.video_ids = parseIds(raw).join(',');
     }
 
     const btn = document.getElementById('runBtn');
     btn.disabled = true;
     btn.classList.add('loading');
     document.getElementById('btnLabel').textContent = 'Running...';
+    stopPoll();
 
     try {
       const res = await fetch(
-        `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${WORKFLOW}/dispatches`,
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Accept': 'application/vnd.github+json',
-            'Content-Type': 'application/json',
-            'X-GitHub-Api-Version': '2022-11-28'
-          },
-          body: JSON.stringify({ ref: 'main', inputs })
-        }
+        `${repoBase()}/actions/workflows/${WORKFLOW}/dispatches`,
+        { method: 'POST', headers: ghHeaders(), body: JSON.stringify({ ref: 'main', inputs }) }
       );
 
       if (res.status === 204) {
-        setStatus('ok', `Sync triggered! <a href="https://github.com/${owner}/${repo}/actions" target="_blank">View on GitHub Actions →</a>`);
+        setStatus('info', 'Workflow triggered! Checking run status…');
+        btn.disabled = false;
+        btn.classList.remove('loading');
+        document.getElementById('btnLabel').textContent = 'Run Sync';
+        setTimeout(() => startPoll(), 3000);
       } else {
         const b = await res.json().catch(() => ({}));
         setStatus('err', `GitHub error ${res.status}: ${b.message || 'Unknown error'}`);
+        resetBtn();
       }
     } catch (e) {
       setStatus('err', 'Network error: ' + e.message);
-    } finally {
-      btn.disabled = false;
-      btn.classList.remove('loading');
-      document.getElementById('btnLabel').textContent = 'Run Sync';
+      resetBtn();
     }
   }
+
+  function resetBtn() {
+    const btn = document.getElementById('runBtn');
+    btn.disabled = false;
+    btn.classList.remove('loading');
+    document.getElementById('btnLabel').textContent = 'Run Sync';
+  }
+
+  // ── Live polling (UPGRADE 1) ────────────────────────────────────
+  function startPoll() {
+    const row   = document.getElementById('pollRow');
+    const dot   = document.getElementById('pollDot');
+    const label = document.getElementById('pollLabel');
+    const link  = document.getElementById('pollLink');
+
+    dot.className = 'poll-dot';
+    label.textContent = 'Waiting for run to start…';
+    row.classList.add('show');
+
+    async function check() {
+      try {
+        const res = await fetch(
+          `${repoBase()}/actions/workflows/${WORKFLOW}/runs?per_page=1`,
+          { headers: ghHeaders() }
+        );
+        if (!res.ok) { pollTimer = setTimeout(check, 5000); return; }
+        const d = await res.json();
+        const run = (d.workflow_runs || [])[0];
+        if (!run) { pollTimer = setTimeout(check, 5000); return; }
+
+        link.href = run.html_url;
+
+        if (run.status === 'queued') {
+          label.textContent = 'Run queued…';
+        } else if (run.status === 'in_progress') {
+          label.textContent = 'Running… (started ' + timeAgo(run.run_started_at) + ')';
+        } else if (run.status === 'completed') {
+          stopPoll();
+          if (run.conclusion === 'success') {
+            dot.className = 'poll-dot ok';
+            label.textContent = 'Completed · ' + timeAgo(run.updated_at);
+            setStatus('ok', `Sync complete ✓ — finished ${timeAgo(run.updated_at)}. <a href="${run.html_url}" target="_blank">View run →</a>`);
+          } else {
+            dot.className = 'poll-dot err';
+            label.textContent = 'Run failed';
+            setStatus('err', `Sync failed (${run.conclusion}). <a href="${run.html_url}" target="_blank">View logs →</a>`);
+          }
+          loadHistory();
+          return;
+        }
+      } catch(_) {}
+      pollTimer = setTimeout(check, 5000);
+    }
+
+    check();
+  }
+
+  function stopPoll() {
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  }
+
+  // ── Run history (UPGRADE 2) ─────────────────────────────────────
+  async function loadHistory() {
+    const owner = document.getElementById('owner').value.trim();
+    const repo  = document.getElementById('repo').value.trim();
+    const token = document.getElementById('token').value.trim();
+    const list  = document.getElementById('historyList');
+
+    if (!owner || !repo || !token) return;
+
+    list.innerHTML = '<span class="history-msg">Loading…</span>';
+
+    try {
+      const res = await fetch(
+        `${repoBase()}/actions/workflows/${WORKFLOW}/runs?per_page=6`,
+        { headers: ghHeaders() }
+      );
+
+      if (!res.ok) { list.innerHTML = '<span class="history-msg">Could not load — check token &amp; repo</span>'; return; }
+
+      const d = await res.json();
+      const runs = d.workflow_runs || [];
+
+      if (!runs.length) { list.innerHTML = '<span class="history-msg">No runs yet</span>'; return; }
+
+      const map = {
+        success:     ['badge-success', '✓ success'],
+        failure:     ['badge-failure',  '✗ failed'],
+        in_progress: ['badge-running',  '⟳ running'],
+        queued:      ['badge-queued',   '· queued'],
+        cancelled:   ['badge-queued',   '— cancelled'],
+      };
+
+      list.innerHTML = runs.map(r => {
+        const key = r.status === 'completed' ? r.conclusion : r.status;
+        const [cls, lbl] = map[key] || ['badge-queued', key];
+        return `<div class="run-row">
+          <span class="run-badge ${cls}">${lbl}</span>
+          <span class="run-meta">#${r.run_number} &nbsp;·&nbsp; ${timeAgo(r.created_at)}</span>
+          <a class="run-link" href="${r.html_url}" target="_blank">logs →</a>
+        </div>`;
+      }).join('');
+    } catch(_) {
+      list.innerHTML = '<span class="history-msg">Network error loading history</span>';
+    }
+  }
+
+  function timeAgo(iso) {
+    const s = Math.floor((Date.now() - new Date(iso)) / 1000);
+    if (s < 60)    return s + 's ago';
+    if (s < 3600)  return Math.floor(s/60) + 'm ago';
+    if (s < 86400) return Math.floor(s/3600) + 'h ago';
+    return Math.floor(s/86400) + 'd ago';
+  }
+
+  // Auto-reload history as user types config
+  let debounce;
+  ['owner','repo','token'].forEach(id => {
+    document.getElementById(id).addEventListener('input', () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(loadHistory, 700);
+    });
+  });
+
+  loadHistory();
 </script>
 </body>
 </html>
