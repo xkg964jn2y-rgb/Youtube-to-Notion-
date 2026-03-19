@@ -228,6 +228,63 @@
     .run-link:hover { color: #555; }
 
     .history-msg { font-size: 0.75rem; color: #aaa; }
+
+    /* Log panel */
+    .log-section {
+      margin-top: 1.4rem;
+      border-top: 1px solid #eee;
+      padding-top: 1rem;
+      display: none;
+    }
+
+    .log-section.show { display: block; }
+
+    .log-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 0.6rem;
+    }
+
+    .log-title {
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .log-close {
+      font-size: 0.7rem;
+      color: #aaa;
+      cursor: pointer;
+      border: none;
+      background: none;
+      padding: 0;
+    }
+
+    .log-close:hover { color: #555; }
+
+    .log-box {
+      background: #fafafa;
+      border: 1px solid #eee;
+      border-radius: 5px;
+      padding: 0.7rem 0.8rem;
+      font-family: 'Courier New', monospace;
+      font-size: 0.7rem;
+      line-height: 1.7;
+      color: #444;
+      max-height: 220px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .log-line-info    { color: #444; }
+    .log-line-success { color: #2e7d32; font-weight: 600; }
+    .log-line-error   { color: #c62828; font-weight: 600; }
+    .log-line-warn    { color: #f57f17; }
+    .log-loading      { color: #aaa; font-style: italic; }
   </style>
 </head>
 <body>
@@ -295,6 +352,15 @@
   <div class="history-section">
     <div class="history-title">Recent Runs</div>
     <div id="historyList"><span class="history-msg">Fill in config above to load history</span></div>
+  </div>
+
+  <!-- Log panel -->
+  <div class="log-section" id="logSection">
+    <div class="log-header">
+      <span class="log-title">Run Logs</span>
+      <button class="log-close" onclick="closeLog()">✕ close</button>
+    </div>
+    <div class="log-box" id="logBox"><span class="log-loading">Fetching logs…</span></div>
   </div>
 </div>
 
@@ -495,6 +561,7 @@
             setStatus('err', `Sync failed (${run.conclusion}). <a href="${run.html_url}" target="_blank">View logs →</a>`);
           }
           loadHistory();
+          loadLog(run.id);
           return;
         }
       } catch(_) {}
@@ -543,10 +610,11 @@
       list.innerHTML = runs.map(r => {
         const key = r.status === 'completed' ? r.conclusion : r.status;
         const [cls, lbl] = map[key] || ['badge-queued', key];
+        const canLog = r.status === 'completed';
         return `<div class="run-row">
           <span class="run-badge ${cls}">${lbl}</span>
           <span class="run-meta">#${r.run_number} &nbsp;·&nbsp; ${timeAgo(r.created_at)}</span>
-          <a class="run-link" href="${r.html_url}" target="_blank">logs →</a>
+          ${canLog ? `<span class="run-link" style="cursor:pointer" onclick="loadLog(${r.id})">logs →</span>` : `<a class="run-link" href="${r.html_url}" target="_blank">view →</a>`}
         </div>`;
       }).join('');
     } catch(_) {
@@ -570,6 +638,78 @@
       debounce = setTimeout(loadHistory, 700);
     });
   });
+
+  // ── Run logs ────────────────────────────────────────────────────
+  async function loadLog(runId) {
+    const logSection = document.getElementById('logSection');
+    const logBox     = document.getElementById('logBox');
+
+    logSection.classList.add('show');
+    logBox.innerHTML = '<span class="log-loading">Fetching logs…</span>';
+    logSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+    try {
+      // Step 1: get list of jobs for this run
+      const jobsRes = await fetch(
+        `${repoBase()}/actions/runs/${runId}/jobs`,
+        { headers: ghHeaders() }
+      );
+      if (!jobsRes.ok) { logBox.textContent = 'Could not fetch jobs.'; return; }
+      const jobsData = await jobsRes.json();
+      const job = (jobsData.jobs || [])[0];
+      if (!job) { logBox.textContent = 'No jobs found for this run.'; return; }
+
+      // Step 2: get log lines from job steps
+      const steps = job.steps || [];
+
+      // Step 3: fetch the full run log (zip — but GitHub also gives plain text per job)
+      const logRes = await fetch(
+        `${repoBase()}/actions/jobs/${job.id}/logs`,
+        { headers: { ...ghHeaders(), 'Accept': 'application/vnd.github+json' } }
+      );
+
+      let rawLog = '';
+      if (logRes.ok) {
+        rawLog = await logRes.text();
+      } else {
+        // Fallback: show step names + conclusions from jobs API
+        rawLog = steps.map(s =>
+          `${s.conclusion === 'success' ? '✓' : s.conclusion === 'failure' ? '✗' : '·'} ${s.name}`
+        ).join('\n');
+      }
+
+      renderLog(rawLog);
+
+    } catch(e) {
+      logBox.textContent = 'Error fetching logs: ' + e.message;
+    }
+  }
+
+  function renderLog(raw) {
+    const logBox = document.getElementById('logBox');
+    // Filter to only lines containing our logger output (INFO/ERROR/WARNING)
+    const allLines = raw.split('\n');
+    const relevant = allLines.filter(l =>
+      /INFO|ERROR|WARNING|Sync complete|succeeded|failed|Fetching|added to Notion|updated successfully|created successfully|up to date/i.test(l)
+    );
+    const lines = (relevant.length ? relevant : allLines).slice(-80); // last 80 lines max
+
+    logBox.innerHTML = lines.map(line => {
+      const text = line.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s+/, '') // strip GH timestamp prefix
+                       .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      if (/ERROR|✗|failed/i.test(line))   return `<div class="log-line-error">${text}</div>`;
+      if (/✅|Sync complete|succeeded/i.test(line)) return `<div class="log-line-success">${text}</div>`;
+      if (/WARNING/i.test(line))           return `<div class="log-line-warn">${text}</div>`;
+      return `<div class="log-line-info">${text}</div>`;
+    }).join('');
+
+    // scroll to bottom
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  function closeLog() {
+    document.getElementById('logSection').classList.remove('show');
+  }
 
   loadHistory();
 </script>
