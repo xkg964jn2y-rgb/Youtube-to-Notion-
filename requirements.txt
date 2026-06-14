@@ -3,3 +3,5 @@ pandas
 pytz
 google-api-python-client
 python-dotenv
+aiohttp
+isodate
