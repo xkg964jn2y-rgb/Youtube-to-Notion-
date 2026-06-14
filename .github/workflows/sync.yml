@@ -12,11 +12,11 @@ on:
           - csv
           - manual
       video_ids:
-        description: "Video IDs (comma-separated, only for manual mode)"
+        description: "Video IDs (comma-separated, manual mode only)"
         required: false
         default: ""
       csv_content:
-        description: "CSV content (paste rows as: VideoId1,VideoId2 — only for csv mode)"
+        description: "Video IDs (comma-separated, csv mode — from UI upload/paste)"
         required: false
         default: ""
 
@@ -25,34 +25,68 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ── 2. Python ────────────────────────────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # ── 3. Cache pip packages across runs ────────────────────────────────────
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # ── 4. Install dependencies ───────────────────────────────────────────────
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Prepare CSV file (if csv mode)
-        if: ${{ github.event.inputs.input_option == 'csv' && github.event.inputs.csv_content != '' }}
-        run: |
-          echo "Video Id" > input_videos.csv
-          echo "${{ github.event.inputs.csv_content }}" | tr ',' '\n' >> input_videos.csv
-          echo "Generated input_videos.csv:"
-          cat input_videos.csv
+      # ── 5. Restore .cache/ from previous run (speeds up subsequent runs) ─────
+      #
+      # WHY: GitHub Actions runners are ephemeral — each run starts with a clean
+      # workspace. Without this step, video_page_map.json, video_etag.json, and
+      # video_props.json are always empty, so every video is treated as a first-
+      # time create instead of a smart skip/restore.
+      #
+      # With this step, the three-way decision (FULL UPDATE / TRUE SKIP / RESTORE)
+      # works correctly across runs:
+      #   • Run 1 (32k CSV): all videos created, caches saved as artifact
+      #   • Run 2+: caches restored, ETags compared, ~0 Notion writes if nothing changed
+      #
+      # Cache key includes the repo name so different repos don't share state.
+      - name: Restore sync cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/
+          key: sync-cache-${{ github.repository }}-${{ github.run_id }}
+          restore-keys: |
+            sync-cache-${{ github.repository }}-
 
-      - name: Run sync script
+      # ── 6. Run sync ───────────────────────────────────────────────────────────
+      - name: Run sync
         env:
-          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
-          VIDEO_DATABASE_ID: ${{ secrets.VIDEO_DATABASE_ID }}
+          YOUTUBE_API_KEY:     ${{ secrets.YOUTUBE_API_KEY }}
+          NOTION_API_KEY:      ${{ secrets.NOTION_API_KEY }}
+          VIDEO_DATABASE_ID:   ${{ secrets.VIDEO_DATABASE_ID }}
           CHANNEL_DATABASE_ID: ${{ secrets.CHANNEL_DATABASE_ID }}
-          INPUT_OPTION: ${{ github.event.inputs.input_option }}
-          VIDEO_IDS: ${{ github.event.inputs.video_ids }}
-          CSV_FILE_PATH: "input_videos.csv"
-        run: |
-          python run_sync.py
+          INPUT_OPTION:        ${{ github.event.inputs.input_option }}
+          VIDEO_IDS:           ${{ github.event.inputs.video_ids }}
+          CSV_CONTENT:         ${{ github.event.inputs.csv_content }}
+          CSV_FILE_PATH:       "input_videos.csv"
+        run: python run_sync.py
+
+      # ── 7. Save .cache/ so next run reuses ETags, page_ids, prop snapshots ───
+      # This runs even if the sync step fails (so partial progress is preserved).
+      - name: Save sync cache
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: .cache/
+          key: sync-cache-${{ github.repository }}-${{ github.run_id }}
