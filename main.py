@@ -1,810 +1,282 @@
-import requests
-import pandas as pd
-import pytz
-import os
-from datetime import datetime
-from googleapiclient.discovery import build
-import logging
-from dotenv import load_dotenv
+"""
+main.py
+───────
+Entry point and async orchestration layer.
 
-# Setup logging
+Flow:
+  1. Validate environment variables
+  2. Load disk-persisted caches
+  3. Read video IDs from CSV or manual input
+  4. Prefetch all existing Notion video IDs + last_edited_times in one pass
+  5. Checkpoint cache immediately after prefetch
+  6. Stream video metadata from YouTube (fully async, batched)
+  7. For each batch: resolve channels, then apply per-video decision:
+       FULL UPDATE / TRUE SKIP / RESTORE
+  8. Checkpoint every 500 videos; final save on exit
+"""
+
+import asyncio
+import csv
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+from dotenv import load_dotenv
+from aiohttp import ClientSession, ClientTimeout
+
+from cache import store
+from youtube.client import get_video_stats_stream
+from notion.client import (
+    prefetch_existing_video_ids,
+    get_or_create_channel,
+    add_or_update_video,
+    NOTION_CONCURRENCY,
+)
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s  %(levelname)-8s  %(message)s',
+    datefmt='%H:%M:%S',
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
 
-# API Keys and Database IDs from environment variables
-api_key = os.getenv('YOUTUBE_API_KEY')
-notion_api_key = os.getenv('NOTION_API_KEY')
-video_database_id = os.getenv('VIDEO_DATABASE_ID')
-channel_database_id = os.getenv('CHANNEL_DATABASE_ID')
+# ── Environment validation ────────────────────────────────────────────────────
 
-# Validate that all required environment variables are set
-if not all([api_key, notion_api_key, video_database_id, channel_database_id]):
-    logger.error("Missing required environment variables. Please check your .env file.")
-    exit(1)
-
-# YouTube API setup
-api_service_name = "youtube"
-api_version = "v3"
-youtube = build(api_service_name, api_version, developerKey=api_key)
-
-# Constants
-YOUTUBE_BATCH_SIZE = 50  # YouTube API limit
-NOTION_API_VERSION = '2022-06-28'
-
-
-def convert_duration(duration):
-    """Convert YouTube video duration format to human-readable format"""
-    try:
-        duration_obj = pd.to_timedelta(duration)
-        hours, minutes, seconds = (
-            duration_obj.components.hours,
-            duration_obj.components.minutes,
-            duration_obj.components.seconds
+def load_config() -> dict:
+    load_dotenv()
+    required = {
+        'YOUTUBE_API_KEY':     os.getenv('YOUTUBE_API_KEY'),
+        'NOTION_API_KEY':      os.getenv('NOTION_API_KEY'),
+        'VIDEO_DATABASE_ID':   os.getenv('VIDEO_DATABASE_ID'),
+        'CHANNEL_DATABASE_ID': os.getenv('CHANNEL_DATABASE_ID'),
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        raise ValueError(
+            f"Missing required environment variables: {', '.join(missing)}\n"
+            f"Please check your .env file."
         )
-        
-        duration_str = ""
-        if hours > 0:
-            duration_str += f"{hours} hours "
-        if minutes > 0:
-            duration_str += f"{minutes} mins "
-        if seconds > 0:
-            duration_str += f"{seconds} secs"
-        
-        return duration_str.strip() if duration_str else "0s"
-    except Exception as e:
-        logger.error(f"Error converting duration '{duration}': {e}")
-        return "Unknown"
+    return required  # type: ignore[return-value]
 
 
-def get_video_stats(youtube, video_ids):
-    """
-    Retrieves video statistics from YouTube API and processes the data.
-    Handles batching for large lists of video IDs.
-    """
-    all_data = []
-    
-    # Process in batches of 50 (YouTube API limit)
-    for i in range(0, len(video_ids), YOUTUBE_BATCH_SIZE):
-        batch = video_ids[i:i + YOUTUBE_BATCH_SIZE]
-        
-        try:
-            request = youtube.videos().list(
-                part="snippet,contentDetails,statistics",
-                id=','.join(batch)
-            )
-            response = request.execute()
-            
-            if not response.get('items'):
-                logger.warning(f"No videos found for batch: {batch}")
-                continue
-            
-            # Process each video item in the API response
-            for item in response['items']:
-                try:
-                    # Parse and format video published date
-                    published_at = parse_and_format_published_date(item['snippet']['publishedAt'])
-                    
-                    # Get the highest resolution thumbnail URL
-                    thumbnail_url = get_thumbnail_url(item['snippet']['thumbnails'])
-                    
-                    # Get human-readable video duration
-                    duration_human_readable = convert_duration(item['contentDetails']['duration'])
-                    
-                    # Extract relevant video information
-                    video_data = {
-                        'Name': item['snippet']['title'],
-                        'Video Id': item['id'],
-                        'Date': published_at,
-                        'Channel': item['snippet']['channelTitle'],
-                        'Channel Id': item['snippet']['channelId'],
-                        'Duration': duration_human_readable,
-                        'Thumbnail': thumbnail_url,
-                        'Category Id': item['snippet']['categoryId'],
-                        'URL': f"https://www.youtube.com/watch?v={item['id']}",
-                        'Channel Custom URL': None,
-                        'Channel Logo URL': None,
-                        'Category Name': None
-                    }
-                    
-                    # Retrieve channel details
-                    channel_data = get_channel_details(youtube, item['snippet']['channelId'])
-                    if channel_data:
-                        video_data.update(channel_data)
-                    
-                    # Retrieve category name
-                    category_name = get_category_name(youtube, item['snippet']['categoryId'])
-                    if category_name:
-                        video_data['Category Name'] = category_name
-                    
-                    all_data.append(video_data)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing video {item.get('id', 'unknown')}: {e}")
-                    continue
-                    
-        except Exception as e:
-            logger.error(f"YouTube API error for batch {i//YOUTUBE_BATCH_SIZE + 1}: {e}")
-            continue
-    
-    return all_data
+# ── Input reading ─────────────────────────────────────────────────────────────
 
-
-def parse_and_format_published_date(published_at):
-    """Parses and formats the video published date."""
-    try:
-        published_at_obj = datetime.strptime(published_at, '%Y-%m-%dT%H:%M:%SZ')
-        published_at_formatted = published_at_obj.astimezone(
-            pytz.timezone('Asia/Kolkata')
-        ).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        return published_at_formatted
-    except Exception as e:
-        logger.error(f"Error parsing date '{published_at}': {e}")
-        return datetime.now().strftime('%Y-%m-%dT%H:%M:%S.000Z')
-
-
-def get_thumbnail_url(thumbnails):
-    """Retrieves the highest resolution thumbnail URL from the available options."""
-    max_resolution_url = thumbnails.get(
-        'maxres',
-        thumbnails.get(
-            'standard',
-            thumbnails.get(
-                'high',
-                thumbnails.get('medium', thumbnails.get('default'))
-            )
-        )
-    )
-    return max_resolution_url['url'] if max_resolution_url else None
-
-
-def get_channel_details(youtube, channel_id):
-    """Retrieves channel details from YouTube API."""
-    try:
-        request = youtube.channels().list(part="snippet,brandingSettings", id=channel_id)
-        response = request.execute()
-        
-        if 'items' in response and len(response['items']) > 0:
-            channel_snippet = response['items'][0]['snippet']
-            
-            # Get channel custom URL
-            channel_custom_url = channel_snippet.get('customUrl', None)
-            full_channel_url = f"https://www.youtube.com/{channel_custom_url}" if channel_custom_url else None
-            
-            # Get channel logo URL
-            channel_thumbnail = channel_snippet['thumbnails']
-            max_resolution_logo_url = channel_thumbnail.get(
-                'high',
-                channel_thumbnail.get('medium', channel_thumbnail.get('default'))
-            )
-            channel_logo_url = max_resolution_logo_url['url'] if max_resolution_logo_url else None
-            
-            return {
-                'Channel Custom URL': full_channel_url,
-                'Channel Logo URL': channel_logo_url
-            }
-    except Exception as e:
-        logger.error(f"Error fetching channel details for {channel_id}: {e}")
-    
-    return {
-        'Channel Custom URL': None,
-        'Channel Logo URL': None
-    }
-
-
-def get_category_name(youtube, category_id):
-    """Retrieves category name based on category ID from YouTube API."""
-    try:
-        request = youtube.videoCategories().list(part="snippet", id=category_id)
-        response = request.execute()
-        
-        if 'items' in response and len(response['items']) > 0:
-            return response['items'][0]['snippet']['title']
-    except Exception as e:
-        logger.error(f"Error fetching category name for {category_id}: {e}")
-    
-    return None
-
-
-def create_channel_entry(channel_name, channel_id, channel_logo_url, channel_custom_url, channel_database_id):
-    """Create a new channel entry in Notion database"""
-    notion_url = 'https://api.notion.com/v1/pages'
-    headers = {
-        'Authorization': f'Bearer {notion_api_key}',
-        'Content-Type': 'application/json',
-        'Notion-Version': NOTION_API_VERSION
-    }
-    
-    properties = {
-        'Name': {
-            'title': [
-                {
-                    'text': {
-                        'content': channel_name[:2000]  # Notion title limit
-                    }
-                }
-            ]
-        },
-        'Channel Id': {
-            'rich_text': [
-                {
-                    'text': {
-                        'content': channel_id
-                    }
-                }
-            ]
-        }
-    }
-    
-    # Only add URL if it exists
-    if channel_custom_url:
-        properties['URL'] = {'url': channel_custom_url}
-    
-    payload = {
-        'parent': {
-            'database_id': channel_database_id
-        },
-        'properties': properties
-    }
-    
-    # Only add icon if logo URL exists
-    if channel_logo_url:
-        payload['icon'] = {
-            'type': 'external',
-            'external': {
-                'url': channel_logo_url
-            }
-        }
-    
-    try:
-        response = requests.post(notion_url, headers=headers, json=payload)
-        
-        if response.status_code == 200:
-            logger.info(f'Channel entry for "{channel_name}" created successfully!')
-            return response.json().get('id')
-        else:
-            logger.error(f'Failed to create channel entry for "{channel_name}": {response.json()}')
-            return None
-    except Exception as e:
-        logger.error(f'Exception creating channel entry for "{channel_name}": {e}')
-        return None
-
-
-def check_if_channel_exists(channel_id, channel_database_id):
-    """Check if channel already exists in Notion database using Channel ID"""
-    notion_url = f'https://api.notion.com/v1/databases/{channel_database_id}/query'
-    headers = {
-        'Authorization': f'Bearer {notion_api_key}',
-        'Content-Type': 'application/json',
-        'Notion-Version': NOTION_API_VERSION
-    }
-    
-    payload = {
-        "filter": {
-            "property": "Channel Id",
-            "rich_text": {
-                "equals": channel_id
-            }
-        }
-    }
-    
-    try:
-        response = requests.post(notion_url, headers=headers, json=payload)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('results') and len(data['results']) > 0:
-                return data['results'][0]['id']
-            return None
-        else:
-            logger.error(f'Failed to check if channel "{channel_id}" exists: {response.json()}')
-            return None
-    except Exception as e:
-        logger.error(f'Exception checking channel existence for "{channel_id}": {e}')
-        return None
-
-
-def get_existing_channel_data(existing_channel_id):
-    """Fetch existing channel data from Notion"""
-    notion_url = f'https://api.notion.com/v1/pages/{existing_channel_id}'
-    headers = {
-        'Authorization': f'Bearer {notion_api_key}',
-        'Content-Type': 'application/json',
-        'Notion-Version': NOTION_API_VERSION
-    }
-    
-    try:
-        response = requests.get(notion_url, headers=headers)
-        
-        if response.status_code == 200:
-            existing_data = response.json().get('properties', {})
-            data_dict = {
-                'Name': existing_data.get('Name', {}).get('title', [{}])[0].get('text', {}).get('content', '') if existing_data.get('Name', {}).get('title') else '',
-                'Channel Id': existing_data.get('Channel Id', {}).get('rich_text', [{}])[0].get('text', {}).get('content', '') if existing_data.get('Channel Id', {}).get('rich_text') else '',
-                'URL': existing_data.get('URL', {}).get('url', '') if existing_data.get('URL', {}) else ''
-            }
-            return data_dict
-        else:
-            logger.error(f'Failed to fetch existing channel data: {response.json()}')
-            return None
-    except Exception as e:
-        logger.error(f'Exception fetching existing channel data: {e}')
-        return None
-
-
-def update_channel_entry(existing_channel_id, channel_name, channel_id, channel_logo_url, channel_custom_url):
-    """Update existing channel entry if data has changed"""
-    existing_data = get_existing_channel_data(existing_channel_id)
-    
-    if not existing_data:
-        return
-    
-    # Check if update is needed
-    update_required = False
-    if (existing_data.get('Name') != channel_name or 
-        existing_data.get('URL') != channel_custom_url or
-        existing_data.get('Channel Id') != channel_id):
-        update_required = True
-    
-    if not update_required:
-        logger.info(f'Channel "{channel_name}" is already up to date')
-        return
-    
-    notion_url = f'https://api.notion.com/v1/pages/{existing_channel_id}'
-    headers = {
-        'Authorization': f'Bearer {notion_api_key}',
-        'Content-Type': 'application/json',
-        'Notion-Version': NOTION_API_VERSION
-    }
-    
-    properties = {
-        'Name': {
-            'title': [
-                {
-                    'text': {
-                        'content': channel_name[:2000]
-                    }
-                }
-            ]
-        },
-        'Channel Id': {
-            'rich_text': [
-                {
-                    'text': {
-                        'content': channel_id
-                    }
-                }
-            ]
-        }
-    }
-    
-    # Only add URL if it exists
-    if channel_custom_url:
-        properties['URL'] = {'url': channel_custom_url}
-    
-    payload = {
-        'properties': properties
-    }
-    
-    # Only add icon if logo URL exists
-    if channel_logo_url:
-        payload['icon'] = {
-            'type': 'external',
-            'external': {
-                'url': channel_logo_url
-            }
-        }
-    
-    try:
-        response = requests.patch(notion_url, headers=headers, json=payload)
-        
-        if response.status_code == 200:
-            logger.info(f'Channel entry for "{channel_name}" updated successfully!')
-        else:
-            logger.error(f'Failed to update channel entry for "{channel_name}": {response.json()}')
-    except Exception as e:
-        logger.error(f'Exception updating channel entry for "{channel_name}": {e}')
-
-
-def get_or_create_channel_entry(channel_name, channel_id, channel_logo_url, channel_custom_url, channel_database_id):
-    """Get existing channel or create new one, with update capability"""
-    existing_channel_id = check_if_channel_exists(channel_id, channel_database_id)
-    
-    if existing_channel_id:
-        # Update the channel if it exists
-        update_channel_entry(existing_channel_id, channel_name, channel_id, channel_logo_url, channel_custom_url)
-        return existing_channel_id
-    else:
-        # Create new channel if it doesn't exist
-        return create_channel_entry(channel_name, channel_id, channel_logo_url, channel_custom_url, channel_database_id)
-
-
-def check_if_video_exists(video_id, video_database_id):
-    """Check if a video entry already exists in Notion database"""
-    notion_url = f'https://api.notion.com/v1/databases/{video_database_id}/query'
-    headers = {
-        'Authorization': f'Bearer {notion_api_key}',
-        'Content-Type': 'application/json',
-        'Notion-Version': NOTION_API_VERSION
-    }
-    
-    query = {
-        "filter": {
-            "property": "Video Id",
-            "rich_text": {
-                "equals": video_id  # Changed from "contains" to "equals" for exact match
-            }
-        }
-    }
-    
-    try:
-        response = requests.post(notion_url, headers=headers, json=query)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('results') and len(data['results']) > 0:
-                return data['results'][0]['id']
-            return None
-        else:
-            logger.error(f'Failed to check if video "{video_id}" exists: {response.json()}')
-            return None
-    except Exception as e:
-        logger.error(f'Exception checking video existence for "{video_id}": {e}')
-        return None
-
-
-def get_existing_video_data(existing_video_id):
-    """Fetch existing video data from Notion"""
-    notion_url = f'https://api.notion.com/v1/pages/{existing_video_id}'
-    headers = {
-        'Authorization': f'Bearer {notion_api_key}',
-        'Content-Type': 'application/json',
-        'Notion-Version': NOTION_API_VERSION
-    }
-    
-    try:
-        response = requests.get(notion_url, headers=headers)
-        
-        if response.status_code == 200:
-            existing_data = response.json().get('properties', {})
-            data_dict = {
-                'Name': existing_data.get('Name', {}).get('title', [{}])[0].get('text', {}).get('content', '') if existing_data.get('Name', {}).get('title') else '',
-                'Date': existing_data.get('Date', {}).get('date', {}).get('start', '') if existing_data.get('Date', {}).get('date') else '',
-                'Duration': existing_data.get('Duration', {}).get('rich_text', [{}])[0].get('text', {}).get('content', '') if existing_data.get('Duration', {}).get('rich_text') else '',
-                'Thumbnail': existing_data.get('Thumbnail', {}).get('url', '') if existing_data.get('Thumbnail', {}) else '',
-                'URL': existing_data.get('URL', {}).get('url', '') if existing_data.get('URL', {}) else '',
-                'Category Id': existing_data.get('Category Id', {}).get('select', {}).get('name', '') if existing_data.get('Category Id', {}).get('select') else '',
-                'Category Name': existing_data.get('Category Name', {}).get('select', {}).get('name', '') if existing_data.get('Category Name', {}).get('select') else '',
-                'Channel': existing_data.get('Channel', {}).get('relation', [{}])[0].get('id', '') if existing_data.get('Channel', {}).get('relation') else ''
-            }
-            return data_dict
-        else:
-            logger.error(f'Failed to fetch existing video data: {response.json()}')
-            return None
-    except Exception as e:
-        logger.error(f'Exception fetching existing video data: {e}')
-        return None
-
-
-def update_video_entry(existing_video_id, data):
-    """Update existing video entry in Notion database if new data differs"""
-    existing_data = get_existing_video_data(existing_video_id)
-    
-    if not existing_data:
-        return
-    
-    # Check if update is needed
-    update_required = False
-    for key, value in data.items():
-        if key in existing_data and existing_data[key] != value:
-            existing_data[key] = value
-            update_required = True
-    
-    if not update_required:
-        logger.info(f'Video "{data["Name"][:50]}..." is already up to date')
-        return
-    
-    notion_url = f'https://api.notion.com/v1/pages/{existing_video_id}'
-    headers = {
-        'Authorization': f'Bearer {notion_api_key}',
-        'Content-Type': 'application/json',
-        'Notion-Version': NOTION_API_VERSION
-    }
-    
-    properties = {
-        'Name': {
-            'title': [
-                {
-                    'text': {
-                        'content': existing_data['Name'][:2000]
-                    }
-                }
-            ]
-        },
-        'Video Id': {
-            'rich_text': [
-                {
-                    'text': {
-                        'content': data['Video Id']
-                    }
-                }
-            ]
-        },
-        'Date': {
-            'date': {
-                'start': existing_data['Date']
-            }
-        },
-        'Duration': {
-            'rich_text': [
-                {
-                    'text': {
-                        'content': data.get('Duration', '')
-                    }
-                }
-            ]
-        },
-        'Category Id': {
-            'select': {
-                'name': data.get('Category Id', '')
-            }
-        },
-        'Category Name': {
-            'select': {
-                'name': data.get('Category Name', '')
-            }
-        }
-    }
-    
-    # Only add URL properties if they exist
-    if data.get('Thumbnail'):
-        properties['Thumbnail'] = {'url': data.get('Thumbnail')}
-    
-    if data.get('URL'):
-        properties['URL'] = {'url': data.get('URL')}
-    
-    payload = {
-        'properties': properties
-    }
-    
-    # Only add cover if thumbnail exists
-    if data.get('Thumbnail'):
-        payload['cover'] = {
-            'type': 'external',
-            'external': {
-                'url': data.get('Thumbnail')
-            }
-        }
-    
-    try:
-        response = requests.patch(notion_url, headers=headers, json=payload)
-        
-        if response.status_code == 200:
-            logger.info(f'Video entry for "{existing_data["Name"][:50]}..." updated successfully!')
-        else:
-            logger.error(f'Failed to update video entry: {response.json()}')
-    except Exception as e:
-        logger.error(f'Exception updating video entry: {e}')
-
-
-def add_data_to_notion(data, channel_entry_id):
-    """Add data to Notion video database with a relation to the channel database"""
-    video_id = data['Video Id']
-    existing_video_id = check_if_video_exists(video_id, video_database_id)
-    
-    if existing_video_id:
-        update_video_entry(existing_video_id, data)
-        return
-    
-    notion_url = 'https://api.notion.com/v1/pages'
-    headers = {
-        'Authorization': f'Bearer {notion_api_key}',
-        'Content-Type': 'application/json',
-        'Notion-Version': NOTION_API_VERSION
-    }
-    
-    properties = {
-        'Name': {
-            'title': [
-                {
-                    'text': {
-                        'content': data['Name'][:2000]
-                    }
-                }
-            ]
-        },
-        'Video Id': {
-            'rich_text': [
-                {
-                    'text': {
-                        'content': data['Video Id']
-                    }
-                }
-            ]
-        },
-        'Date': {
-            'date': {
-                'start': data['Date']
-            }
-        },
-        'Duration': {
-            'rich_text': [
-                {
-                    'text': {
-                        'content': data.get('Duration', '')
-                    }
-                }
-            ]
-        },
-        'Category Id': {
-            'select': {
-                'name': data.get('Category Id', '')
-            }
-        },
-        'Category Name': {
-            'select': {
-                'name': data.get('Category Name', '')
-            }
-        }
-    }
-    
-    # Only add URL properties if they exist
-    if data.get('Thumbnail'):
-        properties['Thumbnail'] = {'url': data.get('Thumbnail')}
-    
-    if data.get('URL'):
-        properties['URL'] = {'url': data.get('URL')}
-    
-    # Add the relation property to link the video entry with the channel entry
-    if channel_entry_id:
-        properties['Channel'] = {
-            'relation': [
-                {
-                    'id': channel_entry_id
-                }
-            ]
-        }
-    
-    payload = {
-        'parent': {
-            'database_id': video_database_id
-        },
-        'properties': properties
-    }
-    
-    # Only add cover if thumbnail exists
-    if data.get('Thumbnail'):
-        payload['cover'] = {
-            'type': 'external',
-            'external': {
-                'url': data.get('Thumbnail')
-            }
-        }
-    
-    try:
-        response = requests.post(notion_url, headers=headers, json=payload)
-        
-        if response.status_code == 200:
-            logger.info(f'Data for video "{data["Name"][:50]}..." added to Notion database successfully!')
-        else:
-            logger.error(f'Failed to add data for video "{data["Name"][:50]}...": {response.json()}')
-    except Exception as e:
-        logger.error(f'Exception adding video to Notion: {e}')
-
-
-def get_video_data(input_option=None, video_ids=None, file_path=None):
-    """Get video data based on input option"""
+def read_video_ids(input_option: str, file_path: str | None = None) -> list[str]:
     if input_option == "csv":
         if not file_path:
-            logger.error("File path is required for CSV input option.")
-            return None
-        
-        try:
-            df = pd.read_csv(file_path)
-            if 'Video Id' not in df.columns:
-                logger.error("CSV file must contain a 'Video Id' column")
-                return None
-            
-            video_ids = df['Video Id'].dropna().astype(str).tolist()
-            
-            if not video_ids:
-                logger.error("No valid video IDs found in CSV file")
-                return None
-                
-        except FileNotFoundError:
-            logger.error(f"File not found: {file_path}")
-            return None
-        except Exception as e:
-            logger.error(f"Error reading CSV file: {e}")
-            return None
-            
-    elif input_option == "manual":
-        if not video_ids:
-            logger.error("No video IDs provided")
-            return None
-            
-        if not video_ids:
-            logger.error("No valid video IDs found in input")
-            return None
-    else:
-        logger.error("Invalid input option. Choose 'csv' or 'manual'")
-        return None
-    
-    logger.info(f"Fetching data for {len(video_ids)} videos...")
-    video_data = get_video_stats(youtube, video_ids)
-    
-    if not video_data:
-        logger.warning("No video data retrieved from YouTube API")
-        return None
-    
-    logger.info(f"Successfully fetched data for {len(video_data)} videos")
-    return video_data
+            raise ValueError("--file is required when using the 'csv' option.")
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"CSV file not found: {file_path}")
 
+        with open(path, newline='', encoding='utf-8') as fh:
+            reader = csv.DictReader(fh)
+            if reader.fieldnames is None or 'Video Id' not in reader.fieldnames:
+                raise ValueError("CSV must have a 'Video Id' column.")
+            seen: set[str] = set()
+            ids: list[str] = []
+            for row in reader:
+                vid = (row.get('Video Id') or '').strip()
+                if vid and vid not in seen:
+                    seen.add(vid)
+                    ids.append(vid)
+
+        if not ids:
+            raise ValueError("No valid video IDs found in CSV.")
+        return ids
+
+    if input_option == "manual":
+        raw = input("Enter video IDs separated by commas: ").strip()
+        seen_m: set[str] = set()
+        ids_m: list[str] = []
+        for v in raw.split(','):
+            vid = v.strip()
+            if vid and vid not in seen_m:
+                seen_m.add(vid)
+                ids_m.append(vid)
+        if not ids_m:
+            raise ValueError("No video IDs provided.")
+        return ids_m
+
+    raise ValueError(f"Unknown input option '{input_option}'. Choose 'csv' or 'manual'.")
+
+
+# ── In-flight channel deduplication ──────────────────────────────────────────
+
+_channel_inflight: dict[str, asyncio.Task] = {}
+
+
+async def _resolve_one_channel(session: ClientSession, notion_key: str,
+                                channel_db_id: str, channel_id: str,
+                                video: dict) -> tuple[str, str | None]:
+    page_id = await get_or_create_channel(
+        session, notion_key, channel_db_id,
+        video['Channel'], channel_id,
+        video['Channel Logo URL'], video['Channel Custom URL']
+    )
+    return channel_id, page_id
+
+
+async def _resolve_channels(session: ClientSession, notion_key: str,
+                             channel_db_id: str,
+                             video_batch: list[dict]) -> dict[str, str | None]:
+    unique: dict[str, dict] = {}
+    for v in video_batch:
+        unique.setdefault(v['Channel Id'], v)
+
+    awaitables = []
+    for cid, v in unique.items():
+        if cid not in _channel_inflight:
+            task = asyncio.create_task(
+                _resolve_one_channel(session, notion_key, channel_db_id, cid, v)
+            )
+            _channel_inflight[cid] = task
+        awaitables.append(_channel_inflight[cid])
+
+    results = await asyncio.gather(*awaitables, return_exceptions=True)
+
+    mapping: dict[str, str | None] = {}
+    for cid, result in zip(unique.keys(), results):
+        if isinstance(result, Exception):
+            logger.error(f"Channel {cid} failed: {result}")
+            mapping[cid] = None
+        else:
+            _, page_id = result
+            mapping[cid] = page_id
+    return mapping
+
+
+async def _push_batch_to_notion(session: ClientSession, notion_key: str,
+                                 video_db_id: str, channel_db_id: str,
+                                 video_batch: list[dict],
+                                 semaphore: asyncio.Semaphore,
+                                 progress: dict,
+                                 progress_lock: asyncio.Lock,
+                                 sync_start_time: float):
+    channel_page_map = await _resolve_channels(
+        session, notion_key, channel_db_id, video_batch
+    )
+    tasks = [
+        add_or_update_video(
+            session, notion_key, video_db_id,
+            v,
+            v.get('etag'),                          # item-level YouTube etag
+            channel_page_map.get(v['Channel Id']),
+            semaphore, progress, progress_lock,
+            sync_start_time,
+        )
+        for v in video_batch
+    ]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ── Main async pipeline ───────────────────────────────────────────────────────
+
+async def run_sync(config: dict, video_ids: list[str]):
+    yt_key        = config['YOUTUBE_API_KEY']
+    notion_key    = config['NOTION_API_KEY']
+    video_db_id   = config['VIDEO_DATABASE_ID']
+    channel_db_id = config['CHANNEL_DATABASE_ID']
+
+    semaphore     = asyncio.Semaphore(NOTION_CONCURRENCY)
+    progress_lock = asyncio.Lock()
+    progress      = {"done": 0, "total": len(video_ids), "skipped": 0, "restored": 0}
+    pending_tasks: set[asyncio.Task] = set()
+    wall_start    = time.monotonic()
+    total_fetched = 0
+
+    timeout = ClientTimeout(connect=5, total=20)
+
+    async with ClientSession(timeout=timeout) as session:
+
+        # ── Prefetch ──────────────────────────────────────────────────────────
+        logger.info("Prefetching existing Notion video IDs + last_edited_times...")
+        await prefetch_existing_video_ids(session, notion_key, video_db_id)
+
+        # Persist immediately — so a Ctrl-C after prefetch doesn't lose
+        # the page_id mappings and last_edited_times we just collected.
+        store.save_to_disk()
+        logger.info("Cache checkpointed after prefetch.")
+
+        # sync_start_time is AFTER prefetch so throughput reflects actual
+        # video processing speed, not the prefetch overhead.
+        sync_start_time = time.monotonic()
+
+        logger.info(f"Streaming sync for {len(video_ids)} video(s)...")
+
+        async for video_batch in get_video_stats_stream(yt_key, video_ids):
+            total_fetched += len(video_batch)
+            logger.info(
+                f"[Stream] Batch of {len(video_batch)} received "
+                f"({total_fetched}/{len(video_ids)}) — dispatching to Notion"
+            )
+            task = asyncio.create_task(
+                _push_batch_to_notion(
+                    session, notion_key, video_db_id, channel_db_id,
+                    video_batch, semaphore, progress, progress_lock,
+                    sync_start_time,
+                )
+            )
+            pending_tasks.add(task)
+            task.add_done_callback(pending_tasks.discard)
+
+        if pending_tasks:
+            results = await asyncio.gather(*pending_tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.error(f"[Notion] Batch push failed: {r}")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    wall_elapsed   = time.monotonic() - wall_start
+    sync_elapsed   = time.monotonic() - sync_start_time
+    done           = progress["done"]
+    skipped        = progress.get("skipped", 0)
+    restored       = progress.get("restored", 0)
+    written        = done - skipped
+    errors         = progress["total"] - done
+    throughput     = done / sync_elapsed if sync_elapsed > 0 else 0
+
+    logger.info("=" * 60)
+    logger.info(f"Sync complete — wall time {wall_elapsed:.1f}s "
+                f"(sync only: {sync_elapsed:.1f}s)")
+    logger.info(f"  {done} processed  |  {written} written  |  "
+                f"{skipped} skipped  |  {restored} restored  |  {errors} error(s)")
+    logger.info(f"  Throughput: {throughput:.1f} videos/sec")
+    logger.info("=" * 60)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    """Main execution function"""
-    logger.info("Starting YouTube to Notion sync...")
-    
-    # Get input option
+    try:
+        config = load_config()
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
+
+    store.load_from_disk()
+
     input_option = input("Choose input option (csv/manual): ").strip().lower()
-    
-    file_path = None
+    file_path    = None
     if input_option == "csv":
-        file_path = input("Enter the path to the CSV file: ").strip()
-    
-    # Get video data
-    video_data = get_video_data(input_option=input_option, file_path=file_path)
-    
-    if not video_data:
-        logger.error("No video data to process. Exiting.")
-        return
-    
-    # Process each video
-    success_count = 0
-    error_count = 0
-    
-    for video_info in video_data:
-        try:
-            channel_name = video_info['Channel']
-            channel_id = video_info['Channel Id']
-            channel_logo_url = video_info['Channel Logo URL']
-            channel_custom_url = video_info['Channel Custom URL']
-            
-            # Get or create channel entry
-            channel_entry_id = get_or_create_channel_entry(
-                channel_name,
-                channel_id,
-                channel_logo_url,
-                channel_custom_url,
-                channel_database_id
-            )
-            
-            if not channel_entry_id:
-                logger.warning(f"Skipping video '{video_info['Name'][:50]}...' - failed to get/create channel")
-                error_count += 1
-                continue
-            
-            # Add video to Notion
-            add_data_to_notion(video_info, channel_entry_id)
-            success_count += 1
-            
-        except Exception as e:
-            logger.error(f"Error processing video '{video_info.get('Name', 'Unknown')[:50]}...': {e}")
-            error_count += 1
-            continue
-    
-    # Summary
-    logger.info("=" * 50)
-    logger.info(f"Sync completed!")
-    logger.info(f"Successfully processed: {success_count}")
-    logger.info(f"Errors: {error_count}")
-    logger.info(f"Total videos: {len(video_data)}")
-    logger.info("=" * 50)
+        file_path = input("Enter path to CSV file: ").strip()
+
+    try:
+        video_ids = read_video_ids(input_option, file_path)
+    except (ValueError, FileNotFoundError) as e:
+        logger.error(str(e))
+        sys.exit(1)
+
+    logger.info(f"Starting YouTube → Notion sync for {len(video_ids)} video(s)...")
+
+    try:
+        asyncio.run(run_sync(config, video_ids))
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user (Ctrl-C) — saving caches and exiting.")
+    finally:
+        store.save_to_disk()
 
 
 if __name__ == "__main__":
