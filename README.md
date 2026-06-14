@@ -1,4 +1,4 @@
-# YouTube → Notion Sync Platform
+# [YouTube → Notion Sync Platform](https://xkg964jn2y-rgb.github.io/Youtube-to-Notion-/)
 
 An automated backend system that synchronizes YouTube video metadata into Notion at scale.
 
