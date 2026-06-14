@@ -23,7 +23,7 @@
       border-radius: 8px;
       padding: 2rem;
       width: 100%;
-      max-width: 440px;
+      max-width: 480px;
       box-shadow: 0 1px 4px rgba(0,0,0,0.06);
     }
 
@@ -108,7 +108,28 @@
     .file-note { font-size: 0.72rem; color: #aaa; margin-bottom: 0.8rem; }
     .file-note.ok { color: #4caf50; }
 
+    .hint {
+      font-size: 0.71rem;
+      color: #aaa;
+      margin-top: 0.3rem;
+      line-height: 1.5;
+    }
+
     .or { text-align: center; font-size: 0.72rem; color: #bbb; margin: 0.6rem 0; }
+
+    /* Chunk warning */
+    .chunk-warn {
+      display: none;
+      background: #fffde7;
+      border: 1px solid #ffe082;
+      border-radius: 5px;
+      padding: 0.55rem 0.7rem;
+      font-size: 0.73rem;
+      color: #f57f17;
+      margin-top: 0.6rem;
+      line-height: 1.5;
+    }
+    .chunk-warn.show { display: block; }
 
     button[type="submit"] {
       width: 100%;
@@ -158,7 +179,7 @@
     .status.info { background: #fffde7; color: #f57f17; border: 1px solid #ffe082; }
     .status a { color: inherit; }
 
-    /* NEW: live poll row */
+    /* Live poll */
     .poll-row {
       display: none;
       align-items: center;
@@ -183,7 +204,7 @@
 
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.25} }
 
-    /* NEW: run history */
+    /* Run history */
     .history-section {
       margin-top: 1.4rem;
       border-top: 1px solid #eee;
@@ -224,7 +245,7 @@
     .badge-queued  { background: #f5f5f5; color: #888;    border: 1px solid #ddd; }
 
     .run-meta { flex: 1; }
-    .run-link { color: #aaa; text-decoration: none; font-size: 0.7rem; }
+    .run-link { color: #aaa; text-decoration: none; font-size: 0.7rem; cursor: pointer; }
     .run-link:hover { color: #555; }
 
     .history-msg { font-size: 0.75rem; color: #aaa; }
@@ -274,7 +295,7 @@
       font-size: 0.7rem;
       line-height: 1.7;
       color: #444;
-      max-height: 220px;
+      max-height: 260px;
       overflow-y: auto;
       white-space: pre-wrap;
       word-break: break-all;
@@ -285,6 +306,23 @@
     .log-line-error   { color: #c62828; font-weight: 600; }
     .log-line-warn    { color: #f57f17; }
     .log-loading      { color: #aaa; font-style: italic; }
+
+    /* Cache status badge */
+    .cache-row {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      margin-top: 0.4rem;
+      font-size: 0.71rem;
+      color: #aaa;
+    }
+    .cache-dot {
+      width: 5px; height: 5px;
+      border-radius: 50%;
+      background: #ccc;
+      flex-shrink: 0;
+    }
+    .cache-dot.warm { background: #4caf50; }
   </style>
 </head>
 <body>
@@ -294,7 +332,7 @@
 
   <!-- GitHub config -->
   <div class="field">
-    <label>GitHub Owner</label>
+    <label>GitHub Owner / Org</label>
     <input id="owner" type="text" placeholder="your-username" />
   </div>
   <div class="field">
@@ -302,13 +340,15 @@
     <input id="repo" type="text" placeholder="your-repo-name" />
   </div>
   <div class="field">
-    <label>Personal Access Token</label>
+    <label>Personal Access Token
+      <span style="font-weight:400;color:#aaa">(needs <code>repo</code> + <code>actions</code> scope)</span>
+    </label>
     <input id="token" type="password" placeholder="ghp_xxxxxxxxxxxxxxxxxxxx" />
   </div>
 
   <hr class="divider" />
 
-  <!-- Mode -->
+  <!-- Mode toggle -->
   <div class="mode-row">
     <button class="mode-btn active" id="btnCsv"    onclick="setMode('csv')">CSV File</button>
     <button class="mode-btn"        id="btnManual" onclick="setMode('manual')">Manual IDs</button>
@@ -324,14 +364,30 @@
       <input type="file" id="csvFile" accept=".csv" style="display:none" onchange="pickFile(event)" />
       <span id="fileLabel">Click or drag a .csv file here</span>
     </div>
-    <div class="file-note" id="fileNote"></div>
+    <div class="file-note" id="fileNote">CSV must have a <strong>Video Id</strong> column header</div>
+
     <div class="or">or paste IDs / YouTube URLs below</div>
-    <textarea id="pasteIds" rows="3" placeholder="dQw4w9WgXcQ&#10;https://youtube.com/watch?v=jNQXAC9IVRw&#10;https://youtu.be/9bZkp7q19f0"></textarea>
+    <textarea id="pasteIds" rows="3"
+      placeholder="dQw4w9WgXcQ&#10;https://youtube.com/watch?v=jNQXAC9IVRw&#10;https://youtu.be/9bZkp7q19f0"
+      oninput="onPasteChange()"></textarea>
+    <div class="hint">One per line or comma-separated. Full YouTube URLs are accepted.</div>
+
+    <!-- Warning shown when ID count exceeds GitHub Actions input limit -->
+    <div class="chunk-warn" id="chunkWarn">
+      ⚠️ GitHub Actions input fields are capped at ~65k characters.
+      Your <strong id="chunkCount">0</strong> IDs exceed this limit.
+      Split your CSV into batches of ~3,000 IDs and run each separately,
+      or commit the CSV file to the repo and trigger the workflow manually.
+    </div>
   </div>
 
   <!-- Manual panel -->
   <div class="panel" id="panelManual">
-    <textarea id="manualIds" rows="3" placeholder="dQw4w9WgXcQ, https://youtu.be/jNQXAC9IVRw, 9bZkp7q19f0"></textarea>
+    <textarea id="manualIds" rows="3"
+      placeholder="dQw4w9WgXcQ, https://youtu.be/jNQXAC9IVRw, 9bZkp7q19f0"
+      oninput="onManualChange()"></textarea>
+    <div class="hint">Comma or newline-separated. YouTube URLs accepted.</div>
+    <div class="chunk-warn" id="chunkWarnManual"></div>
   </div>
 
   <button type="submit" id="runBtn" onclick="trigger()">
@@ -341,14 +397,20 @@
 
   <div class="status" id="status"></div>
 
-  <!-- NEW: live poll indicator -->
+  <!-- Live poll indicator -->
   <div class="poll-row" id="pollRow">
     <div class="poll-dot" id="pollDot"></div>
     <span id="pollLabel">Waiting for run to start…</span>
     <a id="pollLink" href="#" target="_blank" class="run-link" style="margin-left:auto">GitHub →</a>
   </div>
 
-  <!-- NEW: run history -->
+  <!-- Cache status (shown after history loads) -->
+  <div class="cache-row" id="cacheRow" style="display:none">
+    <div class="cache-dot" id="cacheDot"></div>
+    <span id="cacheLabel">Checking cache status…</span>
+  </div>
+
+  <!-- Run history -->
   <div class="history-section">
     <div class="history-title">Recent Runs</div>
     <div id="historyList"><span class="history-msg">Fill in config above to load history</span></div>
@@ -366,11 +428,14 @@
 
 <script>
   const WORKFLOW = 'sync.yml';
+  // GitHub Actions input fields have a hard limit; 65k chars ≈ ~3k IDs of 11 chars + comma
+  const GH_INPUT_CHAR_LIMIT = 64000;
+
   let mode = 'csv';
   let fileIds = [];
   let pollTimer = null;
 
-  // ── Persist fields ──────────────────────────────────────────────
+  // ── Persist fields ────────────────────────────────────────────────────────
   ['owner','repo','token','pasteIds','manualIds'].forEach(id => {
     const el = document.getElementById(id);
     const v = localStorage.getItem('ytn_' + id);
@@ -378,12 +443,12 @@
     el.addEventListener('input', () => localStorage.setItem('ytn_' + id, el.value));
   });
 
-  const sm = localStorage.getItem('ytn_mode');
-  if (sm) setMode(sm);
+  const savedMode = localStorage.getItem('ytn_mode');
+  if (savedMode) setMode(savedMode);
 
-  // ── YouTube URL → ID extractor (UPGRADE 3) ──────────────────────
+  // ── YouTube URL → ID extractor ────────────────────────────────────────────
   function extractId(raw) {
-    raw = raw.trim();
+    raw = (raw || '').trim();
     if (/^[A-Za-z0-9_-]{11}$/.test(raw)) return raw;
     try {
       const url = new URL(raw.startsWith('http') ? raw : 'https://' + raw);
@@ -394,14 +459,18 @@
       if (v) return v;
     } catch(_) {}
     const m = raw.match(/[A-Za-z0-9_-]{11}/);
-    return m ? m[0] : raw;
+    return m ? m[0] : '';
   }
 
   function parseIds(raw) {
-    return raw.split(/[\n,]+/).map(s => extractId(s.trim())).filter(Boolean);
+    return [...new Set(
+      raw.split(/[\n,]+/)
+         .map(s => extractId(s.trim()))
+         .filter(Boolean)
+    )];
   }
 
-  // ── Mode toggle ─────────────────────────────────────────────────
+  // ── Mode toggle ───────────────────────────────────────────────────────────
   function setMode(m) {
     mode = m;
     localStorage.setItem('ytn_mode', m);
@@ -411,7 +480,7 @@
     document.getElementById('panelManual').classList.toggle('active', m === 'manual');
   }
 
-  // ── File drop ───────────────────────────────────────────────────
+  // ── File drop ─────────────────────────────────────────────────────────────
   function ev(e, cls) {
     e.preventDefault();
     document.getElementById('fileDrop').className = 'file-drop' + (cls ? ' ' + cls : '');
@@ -429,25 +498,55 @@
     const reader = new FileReader();
     reader.onload = e => {
       const lines = e.target.result.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
-      const data = /video.?id|^id$/i.test(lines[0]) ? lines.slice(1) : lines;
-      fileIds = data.map(l => extractId(l.split(',')[0].replace(/"/g, '').trim())).filter(Boolean);
+      // Accept both "Video Id" header CSV and plain ID lists
+      const hasHeader = /video.?id|^id$/i.test(lines[0]);
+      const dataLines = hasHeader ? lines.slice(1) : lines;
+      fileIds = [...new Set(
+        dataLines.map(l => extractId(l.split(',')[0].replace(/"/g, '').trim())).filter(Boolean)
+      )];
       document.getElementById('fileDrop').className = 'file-drop loaded';
       document.getElementById('fileLabel').textContent = '✓ ' + file.name;
       const note = document.getElementById('fileNote');
       note.textContent = fileIds.length + ' video IDs loaded';
       note.className = 'file-note ok';
+      checkChunkLimit(fileIds.join(','), 'chunkWarn', 'chunkCount');
     };
     reader.readAsText(file);
   }
 
-  // ── Status helpers ──────────────────────────────────────────────
+  // ── Chunk limit check ─────────────────────────────────────────────────────
+  function checkChunkLimit(csv, warnId, countId) {
+    const warn = document.getElementById(warnId);
+    if (!warn) return;
+    if (csv.length > GH_INPUT_CHAR_LIMIT) {
+      warn.classList.add('show');
+      const cntEl = document.getElementById(countId);
+      if (cntEl) cntEl.textContent = parseIds(csv).length;
+    } else {
+      warn.classList.remove('show');
+    }
+  }
+
+  function onPasteChange() {
+    const raw = document.getElementById('pasteIds').value;
+    const ids = parseIds(raw);
+    if (ids.length) fileIds = [];   // paste overrides file
+    checkChunkLimit(ids.join(','), 'chunkWarn', 'chunkCount');
+  }
+
+  function onManualChange() {
+    const raw = document.getElementById('manualIds').value;
+    checkChunkLimit(parseIds(raw).join(','), 'chunkWarnManual', null);
+  }
+
+  // ── Status helpers ────────────────────────────────────────────────────────
   function setStatus(type, html) {
     const el = document.getElementById('status');
     el.className = 'status show ' + type;
     el.innerHTML = html;
   }
 
-  // ── GitHub helpers ──────────────────────────────────────────────
+  // ── GitHub helpers ────────────────────────────────────────────────────────
   function ghHeaders() {
     return {
       'Authorization': `Bearer ${document.getElementById('token').value.trim()}`,
@@ -463,13 +562,16 @@
     return `https://api.github.com/repos/${o}/${r}`;
   }
 
-  // ── Trigger ─────────────────────────────────────────────────────
+  // ── Trigger workflow ──────────────────────────────────────────────────────
   async function trigger() {
     const owner = document.getElementById('owner').value.trim();
     const repo  = document.getElementById('repo').value.trim();
     const token = document.getElementById('token').value.trim();
 
-    if (!owner || !repo || !token) { setStatus('err', 'Please fill in GitHub owner, repo, and token.'); return; }
+    if (!owner || !repo || !token) {
+      setStatus('err', 'Please fill in GitHub owner, repo, and token.');
+      return;
+    }
 
     const inputs = { input_option: mode };
 
@@ -477,12 +579,24 @@
       const ids = fileIds.length
         ? fileIds
         : parseIds(document.getElementById('pasteIds').value);
-      if (!ids.length) { setStatus('err', 'Upload a CSV or paste at least one video ID or URL.'); return; }
-      inputs.csv_content = ids.join(',');
+      if (!ids.length) {
+        setStatus('err', 'Upload a CSV or paste at least one video ID or URL.');
+        return;
+      }
+      const csv = ids.join(',');
+      if (csv.length > GH_INPUT_CHAR_LIMIT) {
+        setStatus('err',
+          `Too many IDs (${ids.length}) for a single GitHub Actions run. ` +
+          `Split into batches of ~3,000 IDs and run each separately.`
+        );
+        return;
+      }
+      inputs.csv_content = csv;
     } else {
       const raw = document.getElementById('manualIds').value.trim();
       if (!raw) { setStatus('err', 'Enter at least one video ID or URL.'); return; }
-      inputs.video_ids = parseIds(raw).join(',');
+      const ids = parseIds(raw);
+      inputs.video_ids = ids.join(',');
     }
 
     const btn = document.getElementById('runBtn');
@@ -521,7 +635,7 @@
     document.getElementById('btnLabel').textContent = 'Run Sync';
   }
 
-  // ── Live polling (UPGRADE 1) ────────────────────────────────────
+  // ── Live polling ──────────────────────────────────────────────────────────
   function startPoll() {
     const row   = document.getElementById('pollRow');
     const dot   = document.getElementById('pollDot');
@@ -554,11 +668,17 @@
           if (run.conclusion === 'success') {
             dot.className = 'poll-dot ok';
             label.textContent = 'Completed · ' + timeAgo(run.updated_at);
-            setStatus('ok', `Sync complete ✓ — finished ${timeAgo(run.updated_at)}. <a href="${run.html_url}" target="_blank">View run →</a>`);
+            setStatus('ok',
+              `Sync complete ✓ — finished ${timeAgo(run.updated_at)}. ` +
+              `<a href="${run.html_url}" target="_blank">View run →</a>`
+            );
           } else {
             dot.className = 'poll-dot err';
             label.textContent = 'Run failed';
-            setStatus('err', `Sync failed (${run.conclusion}). <a href="${run.html_url}" target="_blank">View logs →</a>`);
+            setStatus('err',
+              `Sync failed (${run.conclusion}). ` +
+              `<a href="${run.html_url}" target="_blank">View logs →</a>`
+            );
           }
           loadHistory();
           loadLog(run.id);
@@ -575,7 +695,7 @@
     if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   }
 
-  // ── Run history (UPGRADE 2) ─────────────────────────────────────
+  // ── Run history ───────────────────────────────────────────────────────────
   async function loadHistory() {
     const owner = document.getElementById('owner').value.trim();
     const repo  = document.getElementById('repo').value.trim();
@@ -588,23 +708,30 @@
 
     try {
       const res = await fetch(
-        `${repoBase()}/actions/workflows/${WORKFLOW}/runs?per_page=6`,
+        `${repoBase()}/actions/workflows/${WORKFLOW}/runs?per_page=8`,
         { headers: ghHeaders() }
       );
 
-      if (!res.ok) { list.innerHTML = '<span class="history-msg">Could not load — check token &amp; repo</span>'; return; }
+      if (!res.ok) {
+        list.innerHTML = '<span class="history-msg">Could not load — check token &amp; repo</span>';
+        return;
+      }
 
       const d = await res.json();
       const runs = d.workflow_runs || [];
 
-      if (!runs.length) { list.innerHTML = '<span class="history-msg">No runs yet</span>'; return; }
+      if (!runs.length) {
+        list.innerHTML = '<span class="history-msg">No runs yet</span>';
+        updateCacheStatus(false, null);
+        return;
+      }
 
       const map = {
-        success:     ['badge-success', '✓ success'],
-        failure:     ['badge-failure',  '✗ failed'],
-        in_progress: ['badge-running',  '⟳ running'],
-        queued:      ['badge-queued',   '· queued'],
-        cancelled:   ['badge-queued',   '— cancelled'],
+        success:   ['badge-success', '✓ success'],
+        failure:   ['badge-failure', '✗ failed'],
+        in_progress: ['badge-running', '⟳ running'],
+        queued:    ['badge-queued',  '· queued'],
+        cancelled: ['badge-queued',  '— cancelled'],
       };
 
       list.innerHTML = runs.map(r => {
@@ -613,12 +740,34 @@
         const canLog = r.status === 'completed';
         return `<div class="run-row">
           <span class="run-badge ${cls}">${lbl}</span>
-          <span class="run-meta">#${r.run_number} &nbsp;·&nbsp; ${timeAgo(r.created_at)}</span>
-          ${canLog ? `<span class="run-link" style="cursor:pointer" onclick="loadLog(${r.id})">logs →</span>` : `<a class="run-link" href="${r.html_url}" target="_blank">view →</a>`}
+          <span class="run-meta">#${r.run_number}&nbsp;·&nbsp;${timeAgo(r.created_at)}</span>
+          ${canLog
+            ? `<span class="run-link" onclick="loadLog(${r.id})">logs →</span>`
+            : `<a class="run-link" href="${r.html_url}" target="_blank">view →</a>`}
         </div>`;
       }).join('');
+
+      // Show cache status based on last successful run
+      const lastSuccess = runs.find(r => r.conclusion === 'success');
+      updateCacheStatus(!!lastSuccess, lastSuccess ? lastSuccess.updated_at : null);
+
     } catch(_) {
       list.innerHTML = '<span class="history-msg">Network error loading history</span>';
+    }
+  }
+
+  function updateCacheStatus(warm, lastRunAt) {
+    const row   = document.getElementById('cacheRow');
+    const dot   = document.getElementById('cacheDot');
+    const label = document.getElementById('cacheLabel');
+    row.style.display = 'flex';
+    if (warm) {
+      dot.className = 'cache-dot warm';
+      label.textContent = `Cache warm — ETags &amp; page_ids from last run (${timeAgo(lastRunAt)})`;
+      label.innerHTML   = `Cache warm — ETags &amp; page_ids from last run (${timeAgo(lastRunAt)})`;
+    } else {
+      dot.className = 'cache-dot';
+      label.textContent = 'No previous run — first sync will create all videos';
     }
   }
 
@@ -639,7 +788,7 @@
     });
   });
 
-  // ── Run logs ────────────────────────────────────────────────────
+  // ── Run logs ──────────────────────────────────────────────────────────────
   async function loadLog(runId) {
     const logSection = document.getElementById('logSection');
     const logBox     = document.getElementById('logBox');
@@ -649,7 +798,6 @@
     logSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 
     try {
-      // Step 1: get list of jobs for this run
       const jobsRes = await fetch(
         `${repoBase()}/actions/runs/${runId}/jobs`,
         { headers: ghHeaders() }
@@ -659,10 +807,6 @@
       const job = (jobsData.jobs || [])[0];
       if (!job) { logBox.textContent = 'No jobs found for this run.'; return; }
 
-      // Step 2: get log lines from job steps
-      const steps = job.steps || [];
-
-      // Step 3: fetch the full run log (zip — but GitHub also gives plain text per job)
       const logRes = await fetch(
         `${repoBase()}/actions/jobs/${job.id}/logs`,
         { headers: { ...ghHeaders(), 'Accept': 'application/vnd.github+json' } }
@@ -672,14 +816,13 @@
       if (logRes.ok) {
         rawLog = await logRes.text();
       } else {
-        // Fallback: show step names + conclusions from jobs API
-        rawLog = steps.map(s =>
+        // Fallback: show step summary from jobs API
+        rawLog = (job.steps || []).map(s =>
           `${s.conclusion === 'success' ? '✓' : s.conclusion === 'failure' ? '✗' : '·'} ${s.name}`
         ).join('\n');
       }
 
       renderLog(rawLog);
-
     } catch(e) {
       logBox.textContent = 'Error fetching logs: ' + e.message;
     }
@@ -687,23 +830,29 @@
 
   function renderLog(raw) {
     const logBox = document.getElementById('logBox');
-    // Filter to only lines containing our logger output (INFO/ERROR/WARNING)
     const allLines = raw.split('\n');
+
+    // Filter to lines that contain our Python logger output
     const relevant = allLines.filter(l =>
-      /INFO|ERROR|WARNING|Sync complete|succeeded|failed|Fetching|added to Notion|updated successfully|created successfully|up to date/i.test(l)
+      /INFO|ERROR|WARNING|Sync complete|Progress|Prefetch|Stream|Created|Updated|Restored|Skipped|skipped|restored/i.test(l)
     );
-    const lines = (relevant.length ? relevant : allLines).slice(-80); // last 80 lines max
+    const lines = (relevant.length ? relevant : allLines).slice(-120);
 
     logBox.innerHTML = lines.map(line => {
-      const text = line.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s+/, '') // strip GH timestamp prefix
-                       .replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      if (/ERROR|✗|failed/i.test(line))   return `<div class="log-line-error">${text}</div>`;
-      if (/✅|Sync complete|succeeded/i.test(line)) return `<div class="log-line-success">${text}</div>`;
-      if (/WARNING/i.test(line))           return `<div class="log-line-warn">${text}</div>`;
+      // Strip GitHub's timestamp prefix (2024-01-15T10:30:00.0000000Z )
+      const text = line
+        .replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+/, '')
+        .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+      if (/ERROR|✗|failed/i.test(line))
+        return `<div class="log-line-error">${text}</div>`;
+      if (/Sync complete|✅|succeeded|ok\s*\|/i.test(line))
+        return `<div class="log-line-success">${text}</div>`;
+      if (/WARNING|warn/i.test(line))
+        return `<div class="log-line-warn">${text}</div>`;
       return `<div class="log-line-info">${text}</div>`;
     }).join('');
 
-    // scroll to bottom
     logBox.scrollTop = logBox.scrollHeight;
   }
 
@@ -711,6 +860,7 @@
     document.getElementById('logSection').classList.remove('show');
   }
 
+  // Initial load
   loadHistory();
 </script>
 </body>
