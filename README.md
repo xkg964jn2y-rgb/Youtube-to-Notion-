@@ -1,73 +1,64 @@
-# YouTube to Notion
+# YouTube → Notion Sync Platform
 
-A Python pipeline that fetches YouTube video and channel metadata via the YouTube Data API and syncs it into a Notion database — with deduplication, smart updates, and relational linking between videos and channels.
+An automated backend system that synchronizes YouTube video metadata into Notion at scale.
 
-## 📊 Scale
-- **22,000+** YouTube videos processed
-- **3,000+** channels tracked
-- Handles batching, error recovery, and duplicate detection automatically
+The system processes **32,000+ YouTube videos across 5,000+ channels**, using asynchronous processing, caching, and API integration to efficiently manage large-scale data synchronization.
 
-## ✨ Features
-- Fetches video details: title, duration, thumbnail, category, publish date
-- Fetches channel details: name, logo, custom URL
-- Creates **relational links** between videos and their channels in Notion
-- **Deduplication** — skips or updates existing entries, never creates duplicates
-- Supports two input modes: CSV file or manual video ID entry
-- Structured logging throughout for easy debugging
+---
 
-## 🛠 Tech Stack
+## 🚀 Features
+
+- Fetches video and channel metadata using YouTube Data API v3
+- Stores structured data into Notion databases
+- Async pipeline for concurrent API requests
+- Deduplication to prevent duplicate entries
+- Incremental sync using caching and change detection
+- Smart upsert logic (create/update only when data changes)
+- GitHub Actions-based automation (no server required)
+- CSV upload + manual input support
+- Lightweight web UI for triggering and monitoring runs
+- Run history + live log tracking
+
+---
+
+## 🧠 Key Engineering Concepts
+
+- Asynchronous programming (Python AsyncIO)
+- API rate-limit optimization
+- Caching & state persistence
+- Deduplication & data consistency
+- Workflow automation using CI/CD (GitHub Actions)
+- System design for large-scale batch processing
+
+---
+
+## 🏗️ Architecture Overview
+
+YouTube Data API → Async Fetcher → Cache Layer → Dedup Engine → Notion Sync Engine → Notion Database
+
+---
+
+## ⚙️ Tech Stack
+
 - Python
+- AsyncIO
 - YouTube Data API v3
 - Notion API
-- `google-api-python-client`, `pandas`, `requests`, `python-dotenv`
+- GitHub Actions
+- HTML / JavaScript (UI)
 
-## ⚙️ Setup
+---
 
-### Configure environment variables
-Create a `.env` file in the root directory:
-```
-YOUTUBE_API_KEY=your_youtube_api_key
-NOTION_API_KEY=your_notion_integration_token
-VIDEO_DATABASE_ID=your_notion_video_database_id
-CHANNEL_DATABASE_ID=your_notion_channel_database_id
-```
+## 📊 Scale
 
-### Set up Notion Databases
+- 32,000+ videos processed
+- 5,000+ channels indexed
+- Optimized for batch + incremental updates
 
-**Video Database** — requires these properties:
+---
 
-| Property      | Type                   |
-|---------------|------------------------|
-| Name          | Title                  |
-| Video Id      | Text                   |
-| Date          | Date                   |
-| Duration      | Text                   |
-| Thumbnail     | URL                    |
-| URL           | URL                    |
-| Category Id   | Select                 |
-| Category Name | Select                 |
-| Channel       | Relation → Channel DB  |
+## 🔥 Highlights
 
-**Channel Database** — requires these properties:
-
-| Property   | Type  |
-|------------|-------|
-| Name       | Title |
-| Channel Id | Text  |
-| URL        | URL   |
-
-## ▶️ Usage
-
-```bash
-python main.py
-```
-
-You'll be prompted to choose an input method:
-- **csv** — provide a CSV file with a `Video Id` column
-- **manual** — enter video IDs directly, comma-separated
-
-
-## 🔑 Getting API Keys
-
-- **YouTube Data API v3** → [Google Cloud Console](https://console.cloud.google.com/)
-- **Notion Integration Token** → [Notion Developers](https://www.notion.so/my-integrations)
+- Reduced redundant API calls using caching + deduplication
+- Designed system to avoid unnecessary Notion writes
+- Fully automated pipeline with zero manual backend hosting
