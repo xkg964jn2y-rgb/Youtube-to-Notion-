@@ -5,14 +5,14 @@ Entry point and async orchestration layer.
 
 Flow:
   1. Validate environment variables
-  2. Load disk-persisted caches
+  2. Initialise SQLite cache (creates .cache/sync.db if absent)
   3. Read video IDs from CSV or manual input
   4. Prefetch all existing Notion video IDs + last_edited_times in one pass
-  5. Checkpoint cache immediately after prefetch
+  5. WAL flush immediately after prefetch
   6. Stream video metadata from YouTube (fully async, batched)
   7. For each batch: resolve channels, then apply per-video decision:
        FULL UPDATE / TRUE SKIP / RESTORE
-  8. Checkpoint every 500 videos; final save on exit
+  8. WAL flush every 500 videos; final flush on exit
 """
 
 import asyncio
@@ -42,7 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── Environment validation ────────────────────────────────────────────────────
+# ── Environment validation ─────────────────────────────────────────────────────
 
 def load_config() -> dict:
     load_dotenv()
@@ -61,7 +61,7 @@ def load_config() -> dict:
     return required  # type: ignore[return-value]
 
 
-# ── Input reading ─────────────────────────────────────────────────────────────
+# ── Input reading ──────────────────────────────────────────────────────────────
 
 def read_video_ids(input_option: str, file_path: str | None = None) -> list[str]:
     if input_option == "csv":
@@ -103,7 +103,7 @@ def read_video_ids(input_option: str, file_path: str | None = None) -> list[str]
     raise ValueError(f"Unknown input option '{input_option}'. Choose 'csv' or 'manual'.")
 
 
-# ── In-flight channel deduplication ──────────────────────────────────────────
+# ── In-flight channel deduplication ───────────────────────────────────────────
 
 _channel_inflight: dict[str, asyncio.Task] = {}
 
@@ -162,7 +162,7 @@ async def _push_batch_to_notion(session: ClientSession, notion_key: str,
         add_or_update_video(
             session, notion_key, video_db_id,
             v,
-            v.get('etag'),                          # item-level YouTube etag
+            v.get('etag'),
             channel_page_map.get(v['Channel Id']),
             semaphore, progress, progress_lock,
             sync_start_time,
@@ -172,7 +172,7 @@ async def _push_batch_to_notion(session: ClientSession, notion_key: str,
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ── Main async pipeline ───────────────────────────────────────────────────────
+# ── Main async pipeline ────────────────────────────────────────────────────────
 
 async def run_sync(config: dict, video_ids: list[str]):
     yt_key        = config['YOUTUBE_API_KEY']
@@ -191,19 +191,23 @@ async def run_sync(config: dict, video_ids: list[str]):
 
     async with ClientSession(timeout=timeout) as session:
 
-        # ── Prefetch ──────────────────────────────────────────────────────────
-        logger.info("Prefetching existing Notion video IDs + last_edited_times...")
-        await prefetch_existing_video_ids(session, notion_key, video_db_id)
-
-        # Persist immediately — so a Ctrl-C after prefetch doesn't lose
-        # the page_id mappings and last_edited_times we just collected.
+        # ── Prefetch ───────────────────────────────────────────────────────────
+        # FULL_PREFETCH=1 forces a complete windowed Notion scan (use when
+        # the DB was lost or videos were added outside this tool).
+        # Default: smart mode — only queries Notion for video IDs not
+        # already in the local SQLite cache.
+        full_scan = os.getenv("FULL_PREFETCH", "").strip() == "1"
+        if full_scan:
+            logger.info("[Prefetch] FULL_PREFETCH=1 — forcing complete Notion scan")
+        await prefetch_existing_video_ids(
+            session, notion_key, video_db_id,
+            video_ids=video_ids,
+            full_scan=full_scan,
+        )
         store.save_to_disk()
         logger.info("Cache checkpointed after prefetch.")
 
-        # sync_start_time is AFTER prefetch so throughput reflects actual
-        # video processing speed, not the prefetch overhead.
         sync_start_time = time.monotonic()
-
         logger.info(f"Streaming sync for {len(video_ids)} video(s)...")
 
         async for video_batch in get_video_stats_stream(yt_key, video_ids):
@@ -228,15 +232,15 @@ async def run_sync(config: dict, video_ids: list[str]):
                 if isinstance(r, Exception):
                     logger.error(f"[Notion] Batch push failed: {r}")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    wall_elapsed   = time.monotonic() - wall_start
-    sync_elapsed   = time.monotonic() - sync_start_time
-    done           = progress["done"]
-    skipped        = progress.get("skipped", 0)
-    restored       = progress.get("restored", 0)
-    written        = done - skipped
-    errors         = progress["total"] - done
-    throughput     = done / sync_elapsed if sync_elapsed > 0 else 0
+    # ── Summary ────────────────────────────────────────────────────────────────
+    wall_elapsed = time.monotonic() - wall_start
+    sync_elapsed = time.monotonic() - sync_start_time
+    done         = progress["done"]
+    skipped      = progress.get("skipped", 0)
+    restored     = progress.get("restored", 0)
+    written      = done - skipped
+    errors       = progress["total"] - done
+    throughput   = done / sync_elapsed if sync_elapsed > 0 else 0
 
     logger.info("=" * 60)
     logger.info(f"Sync complete — wall time {wall_elapsed:.1f}s "
@@ -247,7 +251,7 @@ async def run_sync(config: dict, video_ids: list[str]):
     logger.info("=" * 60)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
     try:
@@ -256,6 +260,7 @@ def main():
         logger.error(str(e))
         sys.exit(1)
 
+    # Open / create SQLite DB (fresh start: empty DB, no JSON migration)
     store.load_from_disk()
 
     input_option = input("Choose input option (csv/manual): ").strip().lower()
@@ -274,7 +279,7 @@ def main():
     try:
         asyncio.run(run_sync(config, video_ids))
     except KeyboardInterrupt:
-        logger.warning("Interrupted by user (Ctrl-C) — saving caches and exiting.")
+        logger.warning("Interrupted by user (Ctrl-C) — flushing cache and exiting.")
     finally:
         store.save_to_disk()
 
